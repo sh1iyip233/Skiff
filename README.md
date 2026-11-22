@@ -1,4 +1,4 @@
-# epicd — 第三方 Epic 游戏下载器
+# Skiff — 第三方 Epic 游戏下载器
 
 用**你自己的 Epic 账号**读取游戏库，按你指定的并发线程数下载、校验并安装游戏，并写出
 `.egstore` 清单让官方启动器识别为“已安装”。
@@ -36,7 +36,7 @@ cargo build --release                                   # 有 MSVC 链接器时
 cargo +stable-x86_64-pc-windows-gnu build --release      # 没有 Visual Studio 时
 ```
 
-产物：`target/release/epicd.exe`（单文件，无运行时不依赖）。
+产物：`target/release/skiff.exe`（单文件，无运行时不依赖）。
 
 > 若两个目标都不可用，先装 GNU 目标：`rustup target add x86_64-pc-windows-gnu`。
 > `scripts\build.ps1` 会自动挑选可用目标。
@@ -54,21 +54,21 @@ cargo +stable-x86_64-pc-windows-gnu build --release      # 没有 Visual Studio 
 
 ```powershell
 # 1) 登录：给出激活链接与 8 位代码，浏览器里确认即可
-epicd auth login
+skiff auth login
 
 # 2) 看游戏库（首次会拉取并缓存）
-epicd library list
-epicd library list --search 赛博
+skiff library list
+skiff library list --search 赛博
 
 # 3) 看某款游戏的构建与体量
-epicd info Fortnite
+skiff info Fortnite
 
 # 4) 安装（默认 16 并发）
-epicd install Fortnite -j 32 --limit-rate 80M
+skiff install Fortnite -j 32 --limit-rate 80M
 
 # 5) 校验 / 修复
-epicd verify "D:\Games\Fortnite"
-epicd verify "D:\Games\Fortnite" --repair
+skiff verify "D:\Games\Fortnite"
+skiff verify "D:\Games\Fortnite" --repair
 ```
 
 ---
@@ -78,9 +78,9 @@ epicd verify "D:\Games\Fortnite" --repair
 `library list` 默认只显示主游戏，DLC 列显示已拥有的追加内容数量；`--all` 才平铺显示它们：
 
 ```powershell
-epicd library list                 # 主游戏 + DLC 数量
-epicd library list --all           # 主游戏和 DLC，DLC 行标注父游戏
-epicd library list --json          # 分组 JSON（games[].dlc[]）
+skiff library list                 # 主游戏 + DLC 数量
+skiff library list --all           # 主游戏和 DLC，DLC 行标注父游戏
+skiff library list --json          # 分组 JSON（games[].dlc[]）
 ```
 
 关联依据是 Epic catalog 的 `mainGameItem`（DLC 的 catalog 条目会带上主条目），解析顺序为：
@@ -94,15 +94,15 @@ catalog id → release appId → 标题唯一匹配 → 同命名空间唯一主
 }
 ```
 
-键为 DLC 的 appName，值为主游戏 appName 或标题；改完执行一次 `epicd library list --refresh`。
+键为 DLC 的 appName，值为主游戏 appName 或标题；改完执行一次 `skiff library list --refresh`。
 
 安装主游戏时默认把同组已拥有的 DLC 一并解析并写入**同一个安装目录**（Epic 的 DLC 本身就是这样
 覆盖到主游戏目录的）；只想要主游戏时加 `--no-dlc`：
 
 ```powershell
-epicd install "Cyberpunk 2077"              # 主游戏 + Phantom Liberty / REDmod
-epicd install "Cyberpunk 2077" --no-dlc     # 只装主游戏
-epicd install "Cyberpunk 2077: Phantom Liberty"  # 自动解析到 Cyberpunk 2077
+skiff install "Cyberpunk 2077"              # 主游戏 + Phantom Liberty / REDmod
+skiff install "Cyberpunk 2077" --no-dlc     # 只装主游戏
+skiff install "Cyberpunk 2077: Phantom Liberty"  # 自动解析到 Cyberpunk 2077
 ```
 
 DLC 的构建解析失败（没有 Live 构建、加密 manifest、网络错误）只会告警并跳过，不会拖垮主游戏。
@@ -127,7 +127,7 @@ DLC 的构建解析失败（没有 Live 构建、加密 manifest、网络错误�
 2. **越界即报错**（退出码 2），不会静默裁剪。
 3. 稳态下在途请求数**恰好等于** `-j`（有测试断言，`peak_inflight` 会打印出来自证）。
 4. 安装结束后会打印 `peak inflight: N (configured M)`，两者应一致。
-5. 持久化：`epicd config set concurrency 32`。
+5. 持久化：`skiff config set concurrency 32`。
 
 调参建议（1 MiB 分块）：
 
@@ -145,18 +145,18 @@ DLC 的构建解析失败（没有 Live 构建、加密 manifest、网络错误�
 ## 5. 命令一览
 
 ```
-epicd auth login [--device-code | --code <authorizationCode>]
-epicd auth logout | status
-epicd library list [--search <text>] [--all] [--refresh] [--json]
-epicd info <appName> [--json]
-epicd install <appName> [-j N] [--write-threads N] [--per-host N] [--limit-rate 50M]
+skiff auth login [--device-code | --code <authorizationCode>]
+skiff auth logout | status
+skiff library list [--search <text>] [--all] [--refresh] [--json]
+skiff info <appName> [--json]
+skiff install <appName> [-j N] [--write-threads N] [--per-host N] [--limit-rate 50M]
                         [--dir <path>] [--platform Windows] [--label Live]
                         [--no-dlc] [--verify] [--repair] [--register-launcher] [-y]
-epicd verify <installDir> [--repair]
-epicd uninstall <installDir> [--keep-files]
-epicd config get | set <key> <value> | list
-epicd debug manifest <file> [--json]
-epicd debug cdn-probe <appName>
+skiff verify <installDir> [--repair]
+skiff uninstall <installDir> [--keep-files]
+skiff config get | set <key> <value> | list
+skiff debug manifest <file> [--json]
+skiff debug cdn-probe <appName>
 ```
 
 全局：`--json`、`--no-progress`。退出码：`0` 成功、`1` 运行错误、`2` 用法错误、`130` 中断。
@@ -168,8 +168,12 @@ epicd debug cdn-probe <appName>
 
 ## 6. 目录与状态文件
 
+状态目录默认是 `%LOCALAPPDATA%\Skiff`。从旧版本升级时，首次运行会自动把
+`%LOCALAPPDATA%\epicd` 迁移过来（优先整目录改名，被占用时复制登录与缓存文件），
+登录态和游戏库缓存不会丢失；也可以用 `SKIFF_HOME` 固定位置。
+
 ```
-%LOCALAPPDATA%\epicd\
+%LOCALAPPDATA%\Skiff\
 ├── config.toml        配置（并发、安装根目录、CDN 偏好等）
 ├── auth.json          账号 token（DPAPI 加密；损坏就重新 login）
 ├── games.json         游戏列表缓存（schema 2，含 DLC 关联字段）
@@ -181,15 +185,15 @@ epicd debug cdn-probe <appName>
 │   ├── <GUID>.item       官方启动器格式的安装清单（主游戏和每个 DLC 各一套）
 │   ├── <GUID>.mancpn     安装对比信息
 │   ├── <GUID>.manifest   原始 manifest 备份
-│   ├── epicd.files       本次安装会写入的文件清单（成功后自动删除）
-│   └── epicd.resume      续传账本（成功后自动删除）
+│   ├── skiff.files       本次安装会写入的文件清单（成功后自动删除）
+│   └── skiff.resume      续传账本（成功后自动删除）
 └── ...游戏文件...
 ```
 
 合并安装时，DLC 的 `.item` 里 `MainGameAppName` 指向主游戏、`InstallLocation` 与主游戏相同，
 `bIsApplication` / `bIsExecutable` 为 `false`；主游戏和 DLC 的文件都写在同一目录。
 
-删除 `.egstore` 会让官方启动器不再识别该安装；`epicd uninstall` 会清理全部组件的
+删除 `.egstore` 会让官方启动器不再识别该安装；`skiff uninstall` 会清理全部组件的
 `.egstore` 以及 `%ProgramData%\Epic\EpicGamesLauncher\Data\Manifests\<GUID>.item`。
 
 **暂停 vs 取消**（GUI 的两个按钮）：
@@ -197,9 +201,9 @@ epicd debug cdn-probe <appName>
 | 操作 | 行为 |
 |---|---|
 | 暂停 | 停止下载，保留已下载分块与续传账本；再点「继续安装」从断点继续 |
-| 取消 | 停止下载，并删除本次安装写入的文件（只删 `epicd.files` 列出的路径，不会动目录里的其他文件；若该目录已有完整安装则保留原文件） |
+| 取消 | 停止下载，并删除本次安装写入的文件（只删 `skiff.files` 列出的路径，不会动目录里的其他文件；若该目录已有完整安装则保留原文件） |
 
-`epicd serve` 的网页界面只有「暂停」；命令行按 `Ctrl-C` 等同暂停。
+`skiff serve` 的网页界面只有「暂停」；命令行按 `Ctrl-C` 等同暂停。
 
 ---
 
@@ -237,14 +241,14 @@ N 个下载线程：GET chunk → SHA-1/rolling hash 校验 → zlib/AES-GCM 解
 
 ## 8. 图形界面（Tauri）
 
-方案已确定为 CLI + Tauri GUI，`epic-core` 是两者的公共内核，GUI 只做薄适配层。
+方案已确定为 CLI + Tauri GUI，`skiff-core` 是两者的公共内核，GUI 只做薄适配层。
 当前仓库先交付 CLI：**构建环境无法访问 crates.io 之外的包源，Tauri 的依赖树（tauri /
 windows-sys）与前端 npm 依赖都无法在此环境拉取与验证**，与其交付一个编译不过的壳，
 不如先把可验证的内核与 CLI 做完。
 
 GUI 落地时只需：
 
-1. `apps/epic-gui/src-tauri` 依赖 `epic-core`，把 `install_manifest`/`download` 跑在
+1. `apps/skiff-gui/src-tauri` 依赖 `skiff-core`，把 `install_manifest`/`download` 跑在
    `tauri::async_runtime::spawn_blocking` 中；
 2. 通过 `Progress` 回调 `app.emit("download://progress", …)`（约 5 Hz 节流）；
 3. 并发控件直接读写 `Concurrency`，与 CLI 完全同一套校验规则。
@@ -254,7 +258,7 @@ GUI 落地时只需：
 ## 9. 测试
 
 ```powershell
-cargo +stable-x86_64-pc-windows-gnu test -p epic-core --offline
+cargo +stable-x86_64-pc-windows-gnu test -p skiff-core --offline
 ```
 
 覆盖：
@@ -332,10 +336,10 @@ Epic 的启动器接口没有公开文档，本项目实现所依据的**协议�
 
 ### 环境适配（本机踩到的坑）
 
-- **状态目录**自动降级：`%LOCALAPPDATA%` → `%APPDATA%` → `%TEMP%` → `./.epicd`（本机 `AppData\Local` 对非管理员不可写）
+- **状态目录**自动降级：`%LOCALAPPDATA%` → `%APPDATA%` → `%TEMP%` → `./.Skiff`（本机 `AppData\Local` 对非管理员不可写）
 - **安装根目录**不可写时提示并兜底，绝不静默改用相对路径
 - **授权码登录先探测可写性**，避免白烧一次性 code
-- `EPICD_HOME` 可固定状态位置；CLI 与 GUI 需用同一个值才共享登录态
+- `SKIFF_HOME` 可固定状态位置；CLI 与 GUI 需用同一个值才共享登录态
 
 ### 构建
 
@@ -350,9 +354,9 @@ Epic 的启动器接口没有公开文档，本项目实现所依据的**协议�
 
 | 形态 | 路径 | 特点 |
 |---|---|---|
-| **Slint 原生窗口（主推）** | `apps/epic-slint` → `epicd-ui.exe`（12.6 MiB） | 自绘、无 WebView2、**免管理员**、启动快 |
-| 浏览器 GUI | `epicd serve --open` | 零依赖，任何机器可用，功能与上面一致 |
-| Tauri（已弃用） | `apps/epic-gui` | 已从 workspace 排除；在本机需管理员权限，仅留作参考 |
+| **Slint 原生窗口（主推）** | `apps/skiff-slint` → `skiff-ui.exe`（12.6 MiB） | 自绘、无 WebView2、**免管理员**、启动快 |
+| 浏览器 GUI | `skiff serve --open` | 零依赖，任何机器可用，功能与上面一致 |
+| Tauri（已弃用） | `apps/skiff-gui` | 已从 workspace 排除；在本机需管理员权限，仅留作参考 |
 
 ### 已知未完成
 

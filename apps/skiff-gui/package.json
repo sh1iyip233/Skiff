@@ -1,0 +1,13 @@
+{
+  "name": "skiff-gui",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Skiff desktop shell (Tauri v2)",
+  "scripts": {
+    "build": "tauri build --no-bundle",
+    "dev": "tauri dev"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

@@ -1,0 +1,18 @@
+[package]
+name = "skiff-gui"
+version = "0.1.0"
+edition = "2021"
+description = "Skiff desktop shell"
+
+[lib]
+name = "skiff_gui_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+skiff-core = { path = "../../../crates/skiff-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2", features = [] }

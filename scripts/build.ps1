@@ -42,10 +42,10 @@ Write-Host "toolchain: $Toolchain"
 & $cargo @buildArgs
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-$exe = Join-Path $root "target\$Profile\epicd.exe"
+$exe = Join-Path $root "target\$Profile\skiff.exe"
 if (Test-Path $exe) {
   Write-Host "built: $exe"
 } else {
-  $alt = Join-Path $root "target\${Toolchain}\$Profile\epicd.exe"
+  $alt = Join-Path $root "target\${Toolchain}\$Profile\skiff.exe"
   if (Test-Path $alt) { Write-Host "built: $alt" }
 }

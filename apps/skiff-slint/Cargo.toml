@@ -1,0 +1,16 @@
+[package]
+name = "skiff-slint"
+version = "0.1.0"
+edition = "2021"
+description = "Skiff desktop UI (Slint, no WebView2, no admin rights)"
+
+[[bin]]
+name = "skiff-ui"
+path = "src/main.rs"
+
+[build-dependencies]
+slint-build = "=1.17.0"
+
+[dependencies]
+skiff-core = { path = "../../crates/skiff-core" }
+slint = "=1.17.0"

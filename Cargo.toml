@@ -1,13 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/epic-core", "crates/epic-cli", "apps/epic-slint"]
-exclude = ["tools/cargo-probe", "apps/epic-gui/src-tauri"]
+members = ["crates/skiff-core", "crates/skiff-cli", "apps/skiff-slint"]
+exclude = ["tools/cargo-probe", "apps/skiff-gui/src-tauri"]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-authors = ["epicd contributors"]
+authors = ["Skiff contributors"]
 description = "Third-party Epic Games library downloader with high-concurrency chunked transfer"
 
 [profile.release]

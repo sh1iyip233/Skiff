@@ -1,4 +1,4 @@
-# Build the Tauri GUI (apps/epic-gui).
+# Build the Tauri GUI (apps/skiff-gui).
 #
 # Three environment choices are required on a machine without Visual Studio; this script pins all
 # of them so the build is reproducible:
@@ -12,7 +12,7 @@ param(
 )
 
 $root = Split-Path -Parent $PSScriptRoot
-$gui = Join-Path $root 'apps\epic-gui'
+$gui = Join-Path $root 'apps\skiff-gui'
 $mingwBin = Join-Path $root 'tools\mingw64\mingw64\bin'
 
 if (Test-Path (Join-Path $mingwBin 'dlltool.exe')) {
@@ -44,6 +44,6 @@ try {
   Pop-Location
 }
 
-$exe = Join-Path $gui 'src-tauri\target\release\epicd-gui.exe'
+$exe = Join-Path $gui 'src-tauri\target\release\skiff-gui.exe'
 if (Test-Path $exe) { Write-Host "built: $exe" }
 exit $code

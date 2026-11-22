@@ -3,6 +3,7 @@
 **/node_modules/
 **/dist/
 /tools/
+**/.Skiff/
 **/.epicd/
 **/*.rs.bk
 *.pdb
@@ -11,5 +12,5 @@
 # Local reference material (third-party source kept only for API parity checks)
 /references/
 
-crates/epic-core/test-tmp
+crates/skiff-core/test-tmp
 /test-tmp

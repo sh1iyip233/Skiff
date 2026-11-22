@@ -19,7 +19,7 @@ d.rectangle([126, 150, 200, 178], fill=(76, 141, 255, 255))
 d.line([(128, 60), (128, 116)], fill=(255, 255, 255, 255), width=22)
 d.polygon([(96, 108), (160, 108), (128, 148)], fill=(255, 255, 255, 255))
 
-out = pathlib.Path(__file__).resolve().parent.parent / "apps" / "epic-gui" / "src-tauri" / "icons"
+out = pathlib.Path(__file__).resolve().parent.parent / "apps" / "skiff-gui" / "src-tauri" / "icons"
 out.mkdir(parents=True, exist_ok=True)
 img.save(out / "icon.ico", sizes=[(16, 16), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
 img.save(out / "icon.png")

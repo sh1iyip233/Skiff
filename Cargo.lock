@@ -1314,40 +1314,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "epic-cli"
-version = "0.1.0"
-dependencies = [
- "epic-core",
- "hex",
- "serde_json",
-]
-
-[[package]]
-name = "epic-core"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "brotli",
- "fastrand",
- "flate2",
- "hex",
- "serde",
- "serde_json",
- "sha1",
- "thiserror 2.0.21",
- "toml 0.8.23",
-]
-
-[[package]]
-name = "epicd-slint"
-version = "0.1.0"
-dependencies = [
- "epic-core",
- "slint",
- "slint-build",
-]
-
-[[package]]
 name = "equator"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4574,6 +4540,40 @@ dependencies = [
  "bitflags 2.13.2",
  "skia-bindings",
  "windows",
+]
+
+[[package]]
+name = "skiff-cli"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "serde_json",
+ "skiff-core",
+]
+
+[[package]]
+name = "skiff-core"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "brotli",
+ "fastrand",
+ "flate2",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha1",
+ "thiserror 2.0.21",
+ "toml 0.8.23",
+]
+
+[[package]]
+name = "skiff-slint"
+version = "0.1.0"
+dependencies = [
+ "skiff-core",
+ "slint",
+ "slint-build",
 ]
 
 [[package]]
