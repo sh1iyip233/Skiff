@@ -72,6 +72,13 @@ pub struct InstallOutcome {
     pub skipped_dlc: Vec<String>,
     /// Same-path files where the earlier component won; the DLC version was not written.
     pub conflicts: usize,
+    /// True when the `.item` files were copied where the official launcher looks for them.
+    pub launcher_registered: bool,
+    /// True when the official launcher was running while the `.item` files were written. It only
+    /// re-reads them on start, so the front-end has to tell the user to exit it completely.
+    pub launcher_running: bool,
+    /// Why registration was skipped; registration never fails the install itself.
+    pub launcher_error: Option<String>,
 }
 
 /// Verification findings.
@@ -1143,8 +1150,23 @@ fn install_components_inner(
     remove_obsolete_files(install_dir, &previous_components, components, &files);
 
     let guids = write_egstore_components(install_dir, components)?;
+    let mut launcher_registered = false;
+    let mut launcher_running = false;
+    let mut launcher_error = None;
     if opts.register_launcher {
-        register_with_launcher_components(components, &guids)?;
+        // Registration is a convenience, not part of the install: a locked-down ProgramData must
+        // not turn a finished install into a failure.
+        match register_with_launcher_components(components, &guids) {
+            Ok(()) => {
+                launcher_registered = true;
+                // Sampled after writing so the answer describes the state the user will observe.
+                launcher_running = epic_launcher_running();
+            }
+            Err(error) => {
+                launcher_error = Some(error.to_string());
+                eprintln!("warning: could not register with the Epic launcher: {error}");
+            }
+        }
     }
     ResumeLedger::remove(install_dir);
     remove_files_list(install_dir);
@@ -1161,7 +1183,11 @@ fn install_components_inner(
         elapsed_secs: started.elapsed().as_secs_f64(),
         components: components.len(),
         conflicts: plan.conflicts,
-        ..Default::default()
+        dlc_apps: Vec::new(),
+        skipped_dlc: Vec::new(),
+        launcher_registered,
+        launcher_running,
+        launcher_error,
     };
     if components.len() > 1 {
         outcome.dlc_apps = components[1..]
@@ -1514,6 +1540,36 @@ fn launcher_manifests_dir() -> PathBuf {
         .join("EpicGamesLauncher")
         .join("Data")
         .join("Manifests")
+}
+
+/// True when an Epic Games Launcher process is running.
+///
+/// The launcher reads `%ProgramData%\Epic\EpicGamesLauncher\Data\Manifests\*.item` only when it
+/// starts (`LogItemFiles`/`LoadItemFiles` in `EpicGamesLauncher.exe`), so an install registered
+/// while it is running stays invisible until it is fully exited. Closing the window is not enough:
+/// the launcher keeps running in the notification area.
+pub fn epic_launcher_running() -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let output = std::process::Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq EpicGamesLauncher.exe", "/NH", "/FO", "CSV"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        match output {
+            Ok(output) => String::from_utf8_lossy(&output.stdout)
+                .to_ascii_lowercase()
+                .contains("epicgameslauncher.exe"),
+            // Without a reliable answer stay quiet rather than nag about a restart.
+            Err(_) => false,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
 }
 
 /// Copy every component's `.item` where the official launcher looks for installed apps.

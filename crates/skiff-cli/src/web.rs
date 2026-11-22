@@ -523,8 +523,19 @@ fn start_install(cfg: &Config, state: &Arc<State>, request: &serde_json::Value) 
                 } else {
                     format!(", {} DLC", outcome.dlc_apps.len())
                 };
+                let launcher = if outcome.launcher_registered {
+                    if outcome.launcher_running {
+                        "; registered with Epic, restart it from the tray to see the game"
+                    } else {
+                        "; registered with Epic, reopen the launcher to see the game"
+                    }
+                } else if outcome.launcher_error.is_some() {
+                    "; not registered with Epic (game files are fine)"
+                } else {
+                    ""
+                };
                 job.summary = format!(
-                    "{} files{dlc}, {} chunks downloaded, peak inflight {}",
+                    "{} files{dlc}, {} chunks downloaded, peak inflight {}{launcher}",
                     outcome.files, outcome.chunks_downloaded, outcome.peak_inflight
                 );
             }

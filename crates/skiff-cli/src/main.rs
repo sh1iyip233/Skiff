@@ -590,6 +590,9 @@ fn cmd_install(args: &Args, cfg: &Config, json: bool) -> Result<()> {
                 "repaired_chunks": outcome.repaired_chunks,
                 "peak_inflight": outcome.peak_inflight,
                 "elapsed_secs": outcome.elapsed_secs,
+                "launcher_registered": outcome.launcher_registered,
+                "launcher_running": outcome.launcher_running,
+                "launcher_error": outcome.launcher_error,
             })
         );
         return Ok(());
@@ -623,6 +626,20 @@ fn cmd_install(args: &Args, cfg: &Config, json: bool) -> Result<()> {
         outcome.peak_inflight, concurrency.downloads
     );
     println!("  elapsed     : {:.1}s", started.elapsed().as_secs_f64());
+    if outcome.launcher_registered {
+        println!("  launcher    : registered with Epic Games Launcher");
+        if outcome.launcher_running {
+            println!(
+                "  提示        : Epic 启动器正在运行。它只在启动时读取安装清单，\
+请从托盘菜单完全退出（关闭窗口不算）后重新打开，游戏才会出现在库里。"
+            );
+        } else {
+            println!("  提示        : 下次打开 Epic 启动器就能在库里看到这个游戏。");
+        }
+    } else if let Some(error) = &outcome.launcher_error {
+        println!("  launcher    : not registered ({error})");
+        println!("  提示        : 游戏文件本身已装好，只是官方启动器不会显示为已安装。");
+    }
     Ok(())
 }
 

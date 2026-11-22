@@ -945,8 +945,22 @@ fn main() -> Result<(), slint::PlatformError> {
                             } else {
                                 format!(" · {} 个 DLC 跳过", outcome.skipped_dlc.len())
                             };
+                            // The launcher only re-reads `Manifests\*.item` on start, so a running
+                            // launcher keeps showing the game as not installed until it is exited
+                            // from the tray; say so instead of leaving the user guessing.
+                            let launcher = if outcome.launcher_registered {
+                                if outcome.launcher_running {
+                                    " · 已注册到 Epic 启动器；请从托盘完全退出启动器后重新打开，游戏才会显示"
+                                } else {
+                                    " · 已注册到 Epic 启动器"
+                                }
+                            } else if outcome.launcher_error.is_some() {
+                                " · 未能注册到 Epic 启动器（不影响游戏文件）"
+                            } else {
+                                ""
+                            };
                             snapshot.note = format!(
-                                "安装完成 · {} 个文件{dlc}{skipped} · 峰值并发 {}",
+                                "安装完成 · {} 个文件{dlc}{skipped} · 峰值并发 {}{launcher}",
                                 outcome.files, outcome.peak_inflight
                             );
                             snapshot.note_error = false;

@@ -249,6 +249,12 @@ component ConfigForm inherits VerticalLayout {
         text: "安装后注册到 Epic 官方启动器";
         checked <=> root.register-launcher;
     }
+    if root.show-launcher-toggle && root.register-launcher : Text {
+        text: "注册后要把 Epic 启动器从托盘完全退出（只关窗口不算）再打开，游戏才会出现在库里。";
+        color: Theme.dim;
+        font-size: 11px;
+        wrap: word-wrap;
+    }
 
     if root.note != "" : Text {
         text: root.note;
