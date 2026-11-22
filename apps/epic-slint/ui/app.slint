@@ -1,0 +1,987 @@
+// Epic game library downloader — desktop UI (Slint).
+//
+// Layout and presentation only: every protocol/download decision lives in `epic-core`, and
+// `main.rs` owns the state that is mirrored into these properties.
+//
+// The page has two modes:
+//   * first run — the "开始配置" dialog collects the account and the install preferences;
+//   * afterwards — the same form is reachable from the 设置 button, so the main view stays focused
+//     on the library and the download.
+
+import { LineEdit, ScrollView, Spinner, Switch } from "std-widgets.slint";
+
+export struct GameRow {
+    title: string,
+    app: string,
+    namespace: string,
+    dlc-count: int,
+}
+
+global Theme {
+    out property <color> bg: #0c0e12;
+    out property <color> panel: #14181f;
+    out property <color> inset: #0f1319;
+    out property <color> line: #222933;
+    out property <color> line-soft: #1a2029;
+    out property <color> text: #e9edf4;
+    out property <color> muted: #8b93a2;
+    out property <color> dim: #606979;
+    out property <color> accent: #4c8dff;
+    out property <color> ok: #35c88a;
+    out property <color> warn: #e7b34a;
+    out property <color> err: #ef6b6e;
+}
+
+// Surface used by every panel.
+component Card inherits Rectangle {
+    background: Theme.panel;
+    border-radius: 14px;
+    border-width: 1px;
+    border-color: Theme.line;
+}
+
+// Text button with hover feedback; the stock widget styles do not match this palette.
+component AppButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> primary: false;
+    in property <bool> flat: false;
+    in property <bool> danger: false;
+    in property <bool> enabled: true;
+    callback clicked;
+
+    height: 34px;
+    border-radius: 9px;
+    border-width: root.primary || root.flat ? 0px : 1px;
+    border-color: root.danger ? #3a2024 : Theme.line;
+    opacity: root.enabled ? 1.0 : 0.4;
+    background: root.primary ? (ta.has-hover ? #5d99ff : Theme.accent)
+        : root.flat ? (ta.has-hover ? #1b2431 : transparent)
+        : root.danger ? (ta.has-hover ? #2c1a1e : #1a1f27)
+        : (ta.has-hover ? #232b37 : #1a1f27);
+    animate background { duration: 120ms; }
+
+    HorizontalLayout {
+        alignment: center;
+        Text {
+            text: root.label;
+            color: root.primary ? #ffffff
+                : root.flat ? #7cadff
+                : root.danger ? Theme.err
+                : Theme.text;
+            font-size: 13px;
+            font-weight: 600;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// One label/value pair in the progress grid.
+component Stat inherits VerticalLayout {
+    in property <string> label;
+    in property <string> value;
+    spacing: 2px;
+    Text { text: root.label; color: Theme.dim; font-size: 11px; }
+    Text { text: root.value; color: Theme.text; font-size: 13px; font-weight: 600; overflow: elide; }
+}
+
+// Small pill used for the phase / account state.
+component Chip inherits Rectangle {
+    in property <string> label;
+    in property <color> tone: Theme.muted;
+    in property <bool> filled: false;
+    height: 22px;
+    border-radius: 11px;
+    background: root.filled ? root.tone : transparent;
+    border-width: root.filled ? 0px : 1px;
+    border-color: root.tone;
+    HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 9px;
+        alignment: center;
+        Text { text: root.label; color: root.filled ? #0c0e12 : root.tone; font-size: 11px; font-weight: 600; }
+    }
+}
+
+// The shared configuration form. Used both by the first-run dialog and by 设置.
+component ConfigForm inherits VerticalLayout {
+    in property <string> account-name: "未连接";
+    in property <string> account-id: "";
+    in property <string> account-initial: "?";
+    in property <bool> logged-in: false;
+    in-out property <string> auth-url: "";
+    in-out property <string> code-input: "";
+    in property <string> login-error: "";
+    in property <bool> login-busy: false;
+    in-out property <string> install-root: "";
+    in-out property <string> concurrency-text: "";
+    in-out property <bool> register-launcher: false;
+    in property <string> note: "";
+    in property <bool> note-error: false;
+    in property <bool> show-launcher-toggle: true;
+
+    callback open-auth-url();
+    callback submit-code(string);
+
+    spacing: 9px;
+
+    // ---- account ---------------------------------------------------------
+    Text { text: "账号"; color: Theme.dim; font-size: 11px; font-weight: 600; }
+
+    HorizontalLayout {
+        spacing: 11px;
+        Rectangle {
+            width: 38px;
+            height: 38px;
+            border-radius: 19px;
+            background: root.logged-in ? #24405f : #202632;
+            border-width: 1px;
+            border-color: root.logged-in ? #315a85 : Theme.line;
+            Text {
+                text: root.account-initial;
+                color: root.logged-in ? #cfe2ff : Theme.muted;
+                font-size: 15px;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            Text { text: root.account-name; color: Theme.text; font-size: 14px; font-weight: 600; overflow: elide; }
+            Text { text: root.account-id; color: Theme.dim; font-size: 11px; overflow: elide; }
+        }
+        Rectangle { horizontal-stretch: 1; background: transparent; }
+        if root.logged-in : Chip { label: "已连接"; tone: Theme.ok; }
+        if !root.logged-in : Chip { label: "未连接"; tone: Theme.dim; }
+    }
+
+    HorizontalLayout {
+        spacing: 8px;
+        LineEdit {
+            text: root.auth-url;
+            read-only: true;
+            min-width: 0px;
+        }
+        AppButton {
+            label: "打开授权页";
+            width: 96px;
+            clicked => { root.open-auth-url(); }
+        }
+    }
+
+    Text {
+        text: "登录后浏览器会显示一段 JSON，复制其中的 authorizationCode 粘贴到下方即可。";
+        color: Theme.dim;
+        font-size: 11px;
+        wrap: word-wrap;
+    }
+
+    LineEdit {
+        text: root.code-input;
+        placeholder-text: "粘贴 authorizationCode 或整段 JSON，回车提交";
+        edited(t) => { root.code-input = t; }
+        accepted(t) => { root.submit-code(t); }
+    }
+
+    HorizontalLayout {
+        vertical-stretch: 0;
+        spacing: 10px;
+        AppButton {
+            label: root.login-busy ? "验证中…" : "提交授权码";
+            primary: true;
+            width: 118px;
+            enabled: !root.login-busy;
+            clicked => { root.submit-code(root.code-input); }
+        }
+        if root.logged-in && root.login-error == "" : Text {
+            text: "当前账号已连接，提交新授权码会切换账号。";
+            color: Theme.dim;
+            font-size: 11px;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+
+    // Errors can be long API messages; give them their own wrapping line instead of eliding them
+    // next to the button.
+    if root.login-error != "" : Text {
+        vertical-stretch: 0;
+        text: root.login-error;
+        color: Theme.err;
+        font-size: 11px;
+        wrap: word-wrap;
+    }
+
+    Rectangle { height: 1px; background: Theme.line-soft; }
+
+    // ---- install preferences --------------------------------------------
+    Text { text: "安装与下载"; color: Theme.dim; font-size: 11px; font-weight: 600; }
+
+    Text { text: "安装根目录"; color: Theme.muted; font-size: 12px; }
+    LineEdit {
+        text: root.install-root;
+        placeholder-text: "例如 D:/Games；留空使用默认目录";
+        edited(t) => { root.install-root = t; }
+    }
+
+    Text { text: "并发线程（1–128）"; color: Theme.muted; font-size: 12px; }
+    LineEdit {
+        text: root.concurrency-text;
+        placeholder-text: "16";
+        edited(t) => { root.concurrency-text = t; }
+    }
+    Text {
+        text: "并发是硬约束：稳态在途请求数恰好等于该值，引擎不会自行增减。";
+        color: Theme.dim;
+        font-size: 11px;
+        wrap: word-wrap;
+    }
+
+    if root.show-launcher-toggle : Switch {
+        text: "安装后注册到 Epic 官方启动器";
+        checked <=> root.register-launcher;
+    }
+
+    if root.note != "" : Text {
+        text: root.note;
+        color: root.note-error ? Theme.err : Theme.ok;
+        font-size: 11px;
+        wrap: word-wrap;
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "游戏下载器";
+    icon: @image-url("icon.png");
+    width: 1180px;
+    height: 820px;
+    background: Theme.bg;
+    default-font-family: "Microsoft YaHei UI";
+
+    // ---- account ---------------------------------------------------------
+    in property <string> account-name: "未登录";
+    in property <string> account-initial: "?";
+    in property <string> account-id: "";
+    in property <bool> logged-in: false;
+
+    // ---- library ---------------------------------------------------------
+    in-out property <[GameRow]> games: [];
+    in-out property <int> selected: -1;
+    in-out property <string> search-text: "";
+    in property <string> games-count-text: "0 款游戏";
+
+    // ---- library refresh -------------------------------------------------
+    in property <bool> refresh-busy: false;
+    in property <float> refresh-progress: 0.0;
+    in property <string> refresh-detail: "";
+    in property <int> refresh-kind: 0;
+
+    // ---- job -------------------------------------------------------------
+    in property <bool> job-running: false;
+    in property <string> phase: "空闲";
+    in property <int> phase-kind: 0;
+    in property <float> progress: 0.0;
+    in property <bool> indeterminate: false;
+    in property <string> percent-text: "0.0%";
+    in property <string> speed: "—";
+    in property <string> eta: "—";
+    in property <string> bytes-text: "—";
+    in property <string> chunks-text: "—";
+    in property <string> inflight-text: "—";
+    in property <string> elapsed-text: "—";
+    in property <string> retries-text: "";
+    in property <string> note: "";
+    in property <bool> note-error: false;
+    in property <string> selected-title: "";
+    in property <string> selected-app: "";
+    in property <string> target-dir: "";
+    // Add-ons owned for the selected main game.
+    in property <int> selected-dlc-count: 0;
+    in property <string> selected-dlc-text: "";
+    // Whether "install" pulls the owned add-ons too (default on).
+    in-out property <bool> include-dlc: true;
+    // A paused or interrupted download exists for the selected game.
+    in property <bool> can-resume: false;
+
+    // ---- dialogs / form --------------------------------------------------
+    in-out property <bool> setup-open: false;
+    in-out property <bool> settings-open: false;
+    in-out property <string> auth-url: "";
+    in-out property <string> code-input: "";
+    in property <string> login-error: "";
+    in property <bool> login-busy: false;
+    in-out property <string> install-root: "";
+    in-out property <string> concurrency-text: "16";
+    in-out property <bool> register-launcher: false;
+    in property <string> config-note: "";
+    in property <bool> config-note-error: false;
+    in property <string> setup-note: "";
+
+    // Sweeps the indeterminate bar; advanced by the timer in main.rs.
+    in-out property <float> pulse: 0.0;
+
+    callback select(int);
+    callback refresh();
+    callback filter-games(string);
+    callback install();
+    callback pause();
+    callback cancel();
+    callback open-settings();
+    callback close-settings();
+    callback save-settings();
+    callback finish-setup();
+    callback login-code-submit(string);
+    callback open-auth-url();
+
+    VerticalLayout {
+        // ================= header =================
+        HorizontalLayout {
+            padding-left: 18px;
+            padding-right: 18px;
+            padding-top: 12px;
+            padding-bottom: 12px;
+            spacing: 10px;
+
+            Rectangle {
+                width: 30px;
+                height: 30px;
+                border-radius: 9px;
+                background: @linear-gradient(135deg, #5b9dff 0%, #3f6fe0 100%);
+                Text {
+                    text: "↓";
+                    color: #ffffff;
+                    font-size: 16px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                spacing: 0px;
+                Text { text: "游戏下载器"; color: Theme.text; font-size: 14px; font-weight: 700; }
+                Text { text: "读取你自己的 Epic 游戏库"; color: Theme.dim; font-size: 10px; }
+            }
+
+            Rectangle { horizontal-stretch: 1; background: transparent; }
+
+            Rectangle {
+                width: root.logged-in ? 208px : 116px;
+                height: 36px;
+                border-radius: 18px;
+                background: Theme.panel;
+                border-width: 1px;
+                border-color: Theme.line;
+                HorizontalLayout {
+                    padding-left: 5px;
+                    padding-right: 12px;
+                    spacing: 8px;
+                    Rectangle {
+                        width: 26px;
+                        height: 26px;
+                        border-radius: 13px;
+                        background: root.logged-in ? #24405f : #202632;
+                        Text {
+                            text: root.account-initial;
+                            color: root.logged-in ? #cfe2ff : Theme.muted;
+                            font-size: 11px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                    Text {
+                        text: root.account-name;
+                        color: root.logged-in ? Theme.text : Theme.muted;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+            }
+
+            AppButton {
+                label: "设置";
+                width: 68px;
+                clicked => { root.open-settings(); }
+            }
+            AppButton {
+                label: root.refresh-busy ? "刷新中…" : "刷新库";
+                primary: true;
+                width: 92px;
+                enabled: !root.refresh-busy;
+                clicked => { root.refresh(); }
+            }
+        }
+
+        // ================= main =================
+        HorizontalLayout {
+            padding-left: 18px;
+            padding-right: 18px;
+            padding-bottom: 18px;
+            spacing: 12px;
+            vertical-stretch: 1;
+
+            // ---- library ----
+            Card {
+                horizontal-stretch: 1;
+                VerticalLayout {
+                    padding: 14px;
+                    spacing: 9px;
+
+                    HorizontalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: "游戏库";
+                            color: Theme.text;
+                            font-size: 13px;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                        Text {
+                            text: root.games-count-text;
+                            color: Theme.dim;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        if root.refresh-busy : Spinner {
+                            min-width: 16px;
+                            min-height: 16px;
+                            indeterminate: true;
+                        }
+                    }
+
+                    // Refresh progress: a determinate strip plus the current phase and elapsed time.
+                    if root.refresh-busy : Rectangle {
+                        height: 4px;
+                        border-radius: 2px;
+                        background: Theme.inset;
+                        Rectangle {
+                            x: 0px;
+                            y: 0px;
+                            height: 100%;
+                            width: parent.width * root.refresh-progress;
+                            border-radius: 2px;
+                            background: @linear-gradient(90deg, #3f7ff0 0%, #6fb0ff 100%);
+                            animate width { duration: 220ms; }
+                        }
+                    }
+
+                    if root.refresh-detail != "" : Text {
+                        text: root.refresh-detail;
+                        color: root.refresh-kind == 1 ? Theme.ok : root.refresh-kind == 2 ? Theme.err : Theme.muted;
+                        font-size: 11px;
+                        overflow: elide;
+                    }
+
+                    LineEdit {
+                        text: root.search-text;
+                        placeholder-text: "搜索标题或 AppName…";
+                        edited(t) => { root.search-text = t; root.filter-games(t); }
+                    }
+
+                    Rectangle {
+                        vertical-stretch: 1;
+                        border-radius: 10px;
+                        background: Theme.inset;
+                        border-width: 1px;
+                        border-color: Theme.line-soft;
+                        clip: true;
+
+                        ScrollView {
+                            VerticalLayout {
+                                for g[i] in root.games : Rectangle {
+                                    height: 56px;
+                                    background: i == root.selected ? #1b2941 : (row-ta.has-hover ? #171d26 : transparent);
+
+                                    Rectangle {
+                                        x: 0px;
+                                        y: 9px;
+                                        width: 3px;
+                                        height: parent.height - 18px;
+                                        border-radius: 2px;
+                                        background: i == root.selected ? Theme.accent : transparent;
+                                    }
+
+                                    VerticalLayout {
+                                        padding-left: 13px;
+                                        padding-right: 12px;
+                                        alignment: center;
+                                        spacing: 2px;
+                                        Text { text: g.title; color: Theme.text; font-size: 13px; font-weight: 500; overflow: elide; }
+                                        Text {
+                                            text: g.app + (g.dlc-count > 0 ? "  ·  DLC " + g.dlc-count : "");
+                                            color: Theme.dim;
+                                            font-size: 11px;
+                                            overflow: elide;
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        x: 0px;
+                                        y: parent.height - 1px;
+                                        width: 100%;
+                                        height: 1px;
+                                        background: Theme.line-soft;
+                                    }
+
+                                    row-ta := TouchArea {
+                                        mouse-cursor: pointer;
+                                        clicked => { root.select(i); }
+                                    }
+                                }
+
+                                if root.games.length == 0 : Rectangle {
+                                    height: 140px;
+                                    background: transparent;
+                                    VerticalLayout {
+                                        alignment: center;
+                                        spacing: 4px;
+                                        Text {
+                                            text: "没有可显示的游戏";
+                                            color: Theme.muted;
+                                            font-size: 13px;
+                                            horizontal-alignment: center;
+                                        }
+                                        Text {
+                                            text: "换个关键词试试，或点右上角「刷新库」重新拉取。";
+                                            color: Theme.dim;
+                                            font-size: 11px;
+                                            horizontal-alignment: center;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---- right column ----
+            VerticalLayout {
+                width: 404px;
+                spacing: 12px;
+
+                Card {
+                    VerticalLayout {
+                        padding: 14px;
+                        spacing: 9px;
+                        HorizontalLayout {
+                            Text {
+                                text: "已选择";
+                                color: Theme.dim;
+                                font-size: 11px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                            }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            if root.selected >= 0 : Chip { label: "可安装"; tone: Theme.accent; }
+                        }
+
+                        if root.selected >= 0 && root.selected < root.games.length : VerticalLayout {
+                            spacing: 2px;
+                            Text { text: root.selected-title; color: Theme.text; font-size: 15px; font-weight: 700; overflow: elide; }
+                            Text { text: root.selected-app; color: Theme.dim; font-size: 11px; overflow: elide; }
+                            if root.selected-dlc-count > 0 : Text {
+                                text: "包含 " + root.selected-dlc-count + " 个 DLC";
+                                color: Theme.accent;
+                                font-size: 11px;
+                            }
+                        }
+
+                        if root.selected-dlc-text != "" : ScrollView {
+                            height: 64px;
+                            Text {
+                                text: root.selected-dlc-text;
+                                color: Theme.muted;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
+                        }
+
+                        if root.selected-dlc-count > 0 : Switch {
+                            text: "安装时包含 DLC";
+                            checked <=> root.include-dlc;
+                        }
+
+                        if root.selected < 0 : Text {
+                            text: "从左侧列表里选一款游戏。";
+                            color: Theme.muted;
+                            font-size: 12px;
+                        }
+
+                        if root.selected >= 0 : Text {
+                            text: "安装到 " + root.target-dir;
+                            color: Theme.dim;
+                            font-size: 11px;
+                            overflow: elide;
+                        }
+
+                        HorizontalLayout {
+                            spacing: 8px;
+                            AppButton {
+                                label: root.job-running ? "安装中…"
+                                    : (root.can-resume ? "继续安装" : "开始安装");
+                                primary: true;
+                                horizontal-stretch: 1;
+                                enabled: root.selected >= 0 && !root.job-running;
+                                clicked => { root.install(); }
+                            }
+                            AppButton {
+                                label: "暂停";
+                                width: 60px;
+                                enabled: root.job-running;
+                                clicked => { root.pause(); }
+                            }
+                            AppButton {
+                                label: "取消";
+                                width: 60px;
+                                danger: true;
+                                enabled: root.job-running || root.can-resume;
+                                clicked => { root.cancel(); }
+                            }
+                        }
+                    }
+                }
+
+                Card {
+                    vertical-stretch: 1;
+                    VerticalLayout {
+                        padding: 16px;
+                        spacing: 12px;
+
+                        HorizontalLayout {
+                            vertical-stretch: 0;
+                            Text {
+                                text: "下载进度";
+                                color: Theme.dim;
+                                font-size: 11px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                            }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            Rectangle {
+                                height: 22px;
+                                border-radius: 11px;
+                                width: 74px;
+                                background: root.phase-kind == 1 ? #1b2a44
+                                    : root.phase-kind == 2 ? #12352a
+                                    : root.phase-kind == 3 ? #3a1b1e
+                                    : root.phase-kind == 4 ? #3a2f14
+                                    : #1a1f27;
+                                Text {
+                                    text: root.phase;
+                                    color: root.phase-kind == 1 ? #9cc0ff
+                                        : root.phase-kind == 2 ? Theme.ok
+                                        : root.phase-kind == 3 ? Theme.err
+                                        : root.phase-kind == 4 ? Theme.warn
+                                        : Theme.muted;
+                                    font-size: 11px;
+                                    font-weight: 600;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+
+                        HorizontalLayout {
+                            vertical-stretch: 0;
+                            spacing: 4px;
+                            Text {
+                                text: root.percent-text;
+                                color: Theme.text;
+                                font-size: 32px;
+                                font-weight: 700;
+                                vertical-alignment: bottom;
+                            }
+                            Rectangle { horizontal-stretch: 1; background: transparent; }
+                            VerticalLayout {
+                                alignment: end;
+                                spacing: 1px;
+                                Text {
+                                    text: root.speed;
+                                    color: Theme.text;
+                                    font-size: 13px;
+                                    font-weight: 600;
+                                    horizontal-alignment: right;
+                                }
+                                Text {
+                                    text: "剩余 " + root.eta;
+                                    color: Theme.dim;
+                                    font-size: 11px;
+                                    horizontal-alignment: right;
+                                }
+                            }
+                        }
+
+                        Rectangle {
+                            height: 10px;
+                            border-radius: 5px;
+                            background: Theme.inset;
+                            border-width: 1px;
+                            border-color: Theme.line-soft;
+                            clip: true;
+
+                            if !root.indeterminate : Rectangle {
+                                x: 0px;
+                                y: 0px;
+                                height: 100%;
+                                width: parent.width * root.progress;
+                                border-radius: 5px;
+                                background: @linear-gradient(90deg, #3f7ff0 0%, #7cc0ff 100%);
+                                animate width { duration: 220ms; }
+                            }
+                            if root.indeterminate : Rectangle {
+                                y: 0px;
+                                height: 100%;
+                                width: 148px;
+                                x: (parent.width - 148px) * root.pulse;
+                                background: @linear-gradient(90deg, transparent 0%, #4c8dff 50%, transparent 100%);
+                            }
+                        }
+
+                        HorizontalLayout {
+                            vertical-stretch: 0;
+                            Stat { label: "已下载"; value: root.bytes-text; horizontal-stretch: 1; }
+                            Stat { label: "速度"; value: root.speed; horizontal-stretch: 1; }
+                        }
+                        HorizontalLayout {
+                            vertical-stretch: 0;
+                            Stat { label: "分块"; value: root.chunks-text; horizontal-stretch: 1; }
+                            Stat { label: "剩余时间"; value: root.eta; horizontal-stretch: 1; }
+                        }
+                        HorizontalLayout {
+                            vertical-stretch: 0;
+                            Stat { label: "在途 / 峰值"; value: root.inflight-text; horizontal-stretch: 1; }
+                            Stat { label: "用时"; value: root.elapsed-text; horizontal-stretch: 1; }
+                        }
+
+                        if root.retries-text != "" : Text {
+                            vertical-stretch: 0;
+                            text: root.retries-text;
+                            color: Theme.warn;
+                            font-size: 11px;
+                        }
+
+                        if root.note != "" : Text {
+                            vertical-stretch: 0;
+                            text: root.note;
+                            color: root.note-error ? Theme.err : Theme.ok;
+                            font-size: 11px;
+                            wrap: word-wrap;
+                        }
+
+                        VerticalLayout {
+                            vertical-stretch: 1;
+                            alignment: center;
+                            if !root.job-running && root.progress == 0.0 : VerticalLayout {
+                                spacing: 3px;
+                                Text {
+                                    text: "还没有下载任务";
+                                    color: Theme.muted;
+                                    font-size: 13px;
+                                    horizontal-alignment: center;
+                                }
+                                Text {
+                                    text: "在左侧列表里选择游戏，然后点「开始安装」。";
+                                    color: Theme.dim;
+                                    font-size: 11px;
+                                    horizontal-alignment: center;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ================= first-run 开始配置 =================
+    if root.setup-open : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+        background: #05070ad9;
+
+        Rectangle {
+            width: 560px;
+            height: min(root.height - 72px, 640px);
+            x: (root.width - self.width) / 2;
+            y: (root.height - self.height) / 2;
+            background: Theme.panel;
+            border-radius: 16px;
+            border-width: 1px;
+            border-color: Theme.line;
+
+            TouchArea { }
+
+            VerticalLayout {
+                padding: 24px;
+                spacing: 14px;
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    Rectangle {
+                        width: 30px;
+                        height: 30px;
+                        border-radius: 9px;
+                        background: @linear-gradient(135deg, #5b9dff 0%, #3f6fe0 100%);
+                        Text {
+                            text: "↓";
+                            color: #ffffff;
+                            font-size: 16px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        spacing: 0px;
+                        Text { text: "开始配置"; color: Theme.text; font-size: 18px; font-weight: 700; }
+                        Text { text: "连接账号、选好安装位置，之后这些选项都在「设置」里。"; color: Theme.dim; font-size: 11px; }
+                    }
+                }
+
+                ScrollView {
+                    vertical-stretch: 1;
+                    ConfigForm {
+                        account-name: root.account-name;
+                        account-id: root.account-id;
+                        account-initial: root.account-initial;
+                        logged-in: root.logged-in;
+                        auth-url <=> root.auth-url;
+                        code-input <=> root.code-input;
+                        login-error: root.login-error;
+                        login-busy: root.login-busy;
+                        install-root <=> root.install-root;
+                        concurrency-text <=> root.concurrency-text;
+                        register-launcher <=> root.register-launcher;
+                        show-launcher-toggle: true;
+                        note: root.setup-note;
+                        note-error: root.config-note-error;
+                        open-auth-url => { root.open-auth-url(); }
+                        submit-code(code) => { root.login-code-submit(code); }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    Text {
+                        text: root.logged-in ? "账号已连接，点右侧完成配置。" : "连接账号后才能完成配置。";
+                        color: Theme.dim;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                        wrap: word-wrap;
+                    }
+                    AppButton {
+                        label: "完成配置";
+                        primary: true;
+                        width: 108px;
+                        enabled: root.logged-in;
+                        clicked => { root.finish-setup(); }
+                    }
+                }
+            }
+        }
+    }
+
+    // ================= 设置 =================
+    if root.settings-open : Rectangle {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 100%;
+        background: #05070acc;
+
+        TouchArea {
+            clicked => { root.close-settings(); }
+        }
+
+        Rectangle {
+            width: 600px;
+            height: min(root.height - 64px, 680px);
+            x: (root.width - self.width) / 2;
+            y: (root.height - self.height) / 2;
+            background: Theme.panel;
+            border-radius: 16px;
+            border-width: 1px;
+            border-color: Theme.line;
+
+            // Swallow clicks so the scrim does not close the dialog from inside.
+            TouchArea { }
+
+            VerticalLayout {
+                padding: 22px;
+                spacing: 12px;
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    Text {
+                        text: "设置";
+                        color: Theme.text;
+                        font-size: 17px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                    AppButton {
+                        label: "关闭";
+                        width: 64px;
+                        clicked => { root.close-settings(); }
+                    }
+                }
+
+                ScrollView {
+                    vertical-stretch: 1;
+                    ConfigForm {
+                        account-name: root.account-name;
+                        account-id: root.account-id;
+                        account-initial: root.account-initial;
+                        logged-in: root.logged-in;
+                        auth-url <=> root.auth-url;
+                        code-input <=> root.code-input;
+                        login-error: root.login-error;
+                        login-busy: root.login-busy;
+                        install-root <=> root.install-root;
+                        concurrency-text <=> root.concurrency-text;
+                        register-launcher <=> root.register-launcher;
+                        show-launcher-toggle: true;
+                        note: root.config-note;
+                        note-error: root.config-note-error;
+                        open-auth-url => { root.open-auth-url(); }
+                        submit-code(code) => { root.login-code-submit(code); }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: 10px;
+                    Text {
+                        text: "改动保存在 config.toml 中。";
+                        color: Theme.dim;
+                        font-size: 11px;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    AppButton {
+                        label: "保存设置";
+                        primary: true;
+                        width: 100px;
+                        clicked => { root.save-settings(); }
+                    }
+                }
+            }
+        }
+    }
+}

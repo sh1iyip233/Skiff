@@ -1,0 +1,16 @@
+[package]
+name = "epicd-slint"
+version = "0.1.0"
+edition = "2021"
+description = "epicd desktop UI (Slint, no WebView2, no admin rights)"
+
+[[bin]]
+name = "epicd-ui"
+path = "src/main.rs"
+
+[build-dependencies]
+slint-build = "=1.17.0"
+
+[dependencies]
+epic-core = { path = "../../crates/epic-core" }
+slint = "=1.17.0"

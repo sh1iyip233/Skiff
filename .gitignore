@@ -1,0 +1,15 @@
+/target
+**/target/
+**/node_modules/
+**/dist/
+/tools/
+**/.epicd/
+**/*.rs.bk
+*.pdb
+.DS_Store
+
+# Local reference material (third-party source kept only for API parity checks)
+/references/
+
+crates/epic-core/test-tmp
+/test-tmp

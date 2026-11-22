@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/epic-core", "crates/epic-cli", "apps/epic-slint"]
+exclude = ["tools/cargo-probe", "apps/epic-gui/src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["epicd contributors"]
+description = "Third-party Epic Games library downloader with high-concurrency chunked transfer"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
