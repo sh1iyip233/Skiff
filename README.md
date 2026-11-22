@@ -14,6 +14,7 @@
   - 命令行（`skiff.exe`）
 - **账号登录**：通过浏览器授权码登录，token 用 Windows DPAPI 按当前用户加密保存在本地，过期自动刷新。
 - **游戏库与 DLC 归组**：拉取游戏库，按 Epic 目录的 `mainGameItem` 自动把 DLC 归到对应主游戏下面，安装主游戏时会顺带把已拥有的 DLC 一起装进同一目录（加 `--no-dlc` 可关闭）。
+- **给已装好的游戏补 DLC**：`skiff dlc add` 只解析并下载缺的那个 DLC，本体不重新解析、不重新下载、不重新校验；`.egstore` 里本体和已装 DLC 的清单原样保留，新 DLC 复用本体的 `InstallationGuid`。支持 `--dry-run` 先看体积再决定。
 - **多线程分块下载**：自己定下载并发数，支持多 CDN 节点轮转、连接复用和自动剔除连不上的节点（比如国内经常超时的 Akamai 节点）。
 - **校验与续传**：支持断点续传、逐块 SHA-1 / rolling hash 校验、zlib 解包，文件坏了可以用 `--repair` 只重下损坏的分块。
 - **兼容官方启动器**：自动写出 `.egstore`（`.item` / `.mancpn` / `.manifest`），也可以选择注册到官方启动器（注册后需要把启动器从托盘完全退出再打开才生效，见下文）。
@@ -81,6 +82,25 @@ DLC 归组依赖 Epic 目录里的 `mainGameItem` 字段。有些额外内容（
 
 如果某个 DLC 拉取失败（比如没发布 Live 版本、manifest 加密或者网络报错），会打个警告跳过，不影响主游戏安装。主游戏和 DLC 如果有同路径但内容不同的文件，目前默认保留主游戏的版本。
 
+### 给已经装好的游戏补 DLC
+
+本体已经装完，事后才想补 DLC，不用重装本体：
+
+```powershell
+skiff dlc list "Cyberpunk 2077"                     # 看哪些 DLC 装了、哪些没装
+skiff dlc add  "Cyberpunk 2077" --dry-run           # 只预览：解析版本和体积，不写盘
+skiff dlc add  "Cyberpunk 2077"                     # 补装所有已拥有但没装的 DLC
+skiff dlc add  "Cyberpunk 2077" "Phantom Liberty"   # 只补指定的那个，标题可以只写一部分
+```
+
+安装目录默认按 `install_root` 自动找（认 `.egstore` 里的 appName），找不到或者装在了别处就用 `--dir` 指过去，指安装目录本身或它的上级目录都行。
+
+具体做法是从 `.egstore` 读回本体的清单参与合并——只为了复用分块和同路径去重，本体的文件既不下载也不重新校验，本体和已装 DLC 的 `.item` / `.mancpn` / `.manifest` 都原样保留，新 DLC 的 `.item` 复用本体的 `InstallationGuid`，所以在官方启动器看来只是同一个安装多了一个附加内容，而不是重新装了一遍。
+
+有一个必要的例外：新 DLC 的文件如果用到和本体相同的分块，这个分块会重新下一次（新文件里还没有这段字节），一次下载写进所有用到它的文件。
+
+退出码和 `install` 一致；`--register-launcher` 只把新 DLC 的 `.item` 拷给官方启动器，本体的注册不动。
+
 ## 并发与限速
 
 下载线程数完全按你设定的来，程序不会偷偷帮你调高或调低。填超范围会直接报错（退出码 2），安装完后会打印实际峰值并发 `peak inflight` 供核对。
@@ -114,6 +134,9 @@ skiff info <appName> [--json]
 skiff install <appName> [-j N] [--write-threads N] [--per-host N] [--limit-rate 50M]
                         [--dir <path>] [--platform Windows] [--label Live]
                         [--no-dlc] [--verify] [--repair] [--register-launcher] [-y]
+skiff dlc list <appName> [--dir <path>] [--json]
+skiff dlc add <appName> [<dlcName>...] [--dry-run] [-j N] [--write-threads N] [--per-host N]
+                        [--limit-rate 50M] [--dir <path>] [--register-launcher] [-y]
 skiff verify <installDir> [--repair]
 skiff uninstall <installDir> [--keep-files]
 skiff config get | set <key> <value> | list
@@ -197,7 +220,7 @@ cargo +stable-x86_64-pc-windows-gnu test -p skiff-core --offline
 4. **注册到官方启动器需要管理员权限**：因为要写 `%ProgramData%`。没权限时注册会失败，但不会让整次安装失败，游戏文件照常保留（只是官方启动器里看不到）。
 5. **反作弊 / EOS 依赖**：本工具只管下载安装，有些游戏不开官方启动器还是进不去。
 6. **只测了 Windows**：Linux/macOS 能编译，但没接 HTTPS 后端，目前没法直接下 Epic 的东西。
-7. **只买了 DLC 没买本体**：`library list --all` 能看到，但无法单独安装。
+7. **只买了 DLC 没买本体**：`library list --all` 能看到，但无法单独安装（补装到已装好的本体上是支持的，见 `skiff dlc add`）。
 8. **中途强退的进度损耗**：续传记录每 64 个分块刷一次盘，按 `Ctrl-C` 最多重下不到 64 MiB。
 9. **官方启动器对合并 DLC 的识别**：`.item` 字段是照着官方样本拼的，万一启动器把某个 DLC 标成未安装，一般不影响主游戏正常游玩。
 

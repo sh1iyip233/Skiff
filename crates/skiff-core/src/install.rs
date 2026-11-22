@@ -654,6 +654,170 @@ fn resolve_component(api: &Api<'_>, game: &GameEntry) -> Result<InstallComponent
     Ok(InstallComponent { game: game.clone(), build, manifest, raw })
 }
 
+/// Rebuild the build record of an installed main game from its `.egstore` metadata.
+///
+/// Only the CDN base URLs and the version string are consumed, so the main game does not have to be
+/// resolved (or downloaded) again. Re-resolving it would also silently move the merge surface to a
+/// newer build than the one actually on disk.
+fn installed_build(component: &InstalledComponent, game: &GameEntry) -> BuildInfo {
+    let text = |key: &str| {
+        component.item.get(key).and_then(|value| value.as_str()).unwrap_or_default().to_string()
+    };
+    let base_urls: Vec<String> = component
+        .item
+        .get("BaseURLs")
+        .and_then(|value| value.as_array())
+        .map(|urls| {
+            urls.iter()
+                .filter_map(|url| url.as_str())
+                .filter(|url| !url.trim().is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let build_version = match text("AppVersionString") {
+        version if version.is_empty() => component.manifest.meta.build_version.clone(),
+        version => version,
+    };
+    BuildInfo {
+        app_name: game.app_name.clone(),
+        namespace: game.namespace.clone(),
+        catalog_item_id: game.catalog_item_id.clone(),
+        label_name: text("LabelName"),
+        build_version,
+        manifest_uri: String::new(),
+        manifest_hash: String::new(),
+        base_urls,
+    }
+}
+
+/// Add owned add-ons to an install that already contains the main game.
+///
+/// Unlike [`install_bundle`], the main game is not resolved again: its installed manifest is read
+/// back from `.egstore` and merged in only so that path de-duplication and chunk reuse stay
+/// correct. Its files are therefore never downloaded, re-verified or deleted, and the metadata of
+/// both the main game and of add-ons an earlier run installed is preserved byte for byte.
+pub fn add_dlc(
+    client: &Client,
+    api: &Api<'_>,
+    base: &GameEntry,
+    dlcs: &[GameEntry],
+    opts: &InstallOptions,
+    on_progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
+) -> Result<InstallOutcome> {
+    let cancel = shared_cancel();
+    let api = api.clone().with_cancel(cancel.clone());
+    if cancelled(&cancel) {
+        return Err(cancelled_error());
+    }
+
+    // Already installed add-ons are filtered out here as well so they are never resolved (and
+    // never re-downloaded) just to be dropped again by the merge.
+    let installed = load_installed_components(&opts.install_dir).unwrap_or_default();
+    let mut additions: Vec<InstallComponent> = Vec::new();
+    let mut skipped_dlc: Vec<String> = Vec::new();
+    for dlc in dlcs {
+        if dlc.app_name.eq_ignore_ascii_case(&base.app_name) {
+            continue;
+        }
+        if installed
+            .iter()
+            .any(|component| component.app_name.eq_ignore_ascii_case(&dlc.app_name))
+        {
+            continue;
+        }
+        if additions
+            .iter()
+            .any(|component| component.game.app_name.eq_ignore_ascii_case(&dlc.app_name))
+        {
+            continue;
+        }
+        if cancelled(&cancel) {
+            return Err(cancelled_error());
+        }
+        match resolve_component(&api, dlc) {
+            Ok(component) => additions.push(component),
+            Err(e) => {
+                eprintln!(
+                    "warning: skipping DLC {} ({}): {e}",
+                    if dlc.title.is_empty() { &dlc.app_name } else { &dlc.title },
+                    dlc.app_name
+                );
+                skipped_dlc.push(dlc.app_name.clone());
+            }
+        }
+    }
+
+    let mut outcome = add_components_to_install(client, base, &additions, opts, on_progress)?;
+    outcome.skipped_dlc = skipped_dlc;
+    Ok(outcome)
+}
+
+/// Core of [`add_dlc`] taking already resolved components.
+///
+/// Split out so the "add to a finished install" path can be tested against a mock CDN without an
+/// Epic account, the same way [`install_manifest`] covers a fresh install.
+pub fn add_components_to_install(
+    client: &Client,
+    base: &GameEntry,
+    additions: &[InstallComponent],
+    opts: &InstallOptions,
+    on_progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
+) -> Result<InstallOutcome> {
+    let cancel = shared_cancel();
+    if cancelled(&cancel) {
+        return Err(cancelled_error());
+    }
+
+    let installed = load_installed_components(&opts.install_dir).map_err(|e| {
+        Error::usage(format!(
+            "{} has no install metadata to add an add-on to ({e}); install the main game first",
+            opts.install_dir.display()
+        ))
+    })?;
+    let installed_base = installed
+        .iter()
+        .find(|component| component.app_name.eq_ignore_ascii_case(&base.app_name))
+        .ok_or_else(|| {
+            Error::usage(format!(
+                "{} is not installed in {} (found: {})",
+                base.app_name,
+                opts.install_dir.display(),
+                installed
+                    .iter()
+                    .map(|component| component.app_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })?;
+
+    let mut components = vec![InstallComponent {
+        game: base.clone(),
+        build: installed_build(installed_base, base),
+        manifest: installed_base.manifest.clone(),
+        raw: installed_base.raw.clone(),
+    }];
+    for component in additions {
+        if component.game.app_name.eq_ignore_ascii_case(&base.app_name) {
+            continue;
+        }
+        if installed
+            .iter()
+            .any(|old| old.app_name.eq_ignore_ascii_case(&component.game.app_name))
+        {
+            continue;
+        }
+        components.push(component.clone());
+    }
+    if components.len() == 1 {
+        return Err(Error::usage(
+            "nothing to add: every requested add-on is already installed or could not be resolved",
+        ));
+    }
+
+    install_components_preserving(client, &components, 1, opts, on_progress)
+}
+
 /// Install from an already fetched manifest.
 ///
 /// Split out from [`install`] so the whole layout/resume/verify/egstore pipeline can be tested
@@ -687,12 +851,31 @@ pub fn install_components(
     opts: &InstallOptions,
     on_progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
 ) -> Result<InstallOutcome> {
+    install_components_preserving(client, components, 0, opts, on_progress)
+}
+
+/// [`install_components`] with the first `preserve` components treated as already installed.
+///
+/// A preserved component still takes part in the merge (so path de-duplication and chunk reuse stay
+/// correct) but its files are never downloaded, re-verified or deleted, and the `.egstore` metadata
+/// an earlier run wrote for it is left byte-for-byte alone. This is what lets an add-on be added to
+/// a finished install without touching the main game.
+fn install_components_preserving(
+    client: &Client,
+    components: &[InstallComponent],
+    preserve: usize,
+    opts: &InstallOptions,
+    on_progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
+) -> Result<InstallOutcome> {
     if components.is_empty() {
         return Err(Error::usage("an install needs at least one component"));
     }
+    if preserve >= components.len() {
+        return Err(Error::usage("an install needs at least one component to write"));
+    }
     // Remembered before this run touches anything: it decides whether a cancel may delete files.
     let had_completed_install = load_installed_manifest(&opts.install_dir).is_ok();
-    let result = install_components_inner(client, components, opts, on_progress);
+    let result = install_components_inner(client, components, preserve, opts, on_progress);
 
     // A cancel (as opposed to a pause) removes what this run created before the error is returned.
     if let Err(Error::Cancelled { .. }) = &result {
@@ -831,6 +1014,7 @@ fn bundle_signature(components: &[InstallComponent]) -> Vec<u8> {
 fn install_components_inner(
     client: &Client,
     components: &[InstallComponent],
+    preserve: usize,
     opts: &InstallOptions,
     on_progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
 ) -> Result<InstallOutcome> {
@@ -890,20 +1074,36 @@ fn install_components_inner(
     let mut unchanged_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
     if !previous_chunks.is_empty() {
         let changed = crate::update::changed_chunks(&previous_chunks, &manifest.chunks);
-        let reusable = crate::update::reusable_chunk_count(&previous_chunks, &manifest.chunks);
-        if reusable > 0 {
-            for (index, chunk) in manifest.chunks.iter().enumerate() {
-                if !changed.contains(&chunk.guid) {
-                    done.insert(index, ());
-                }
+        let unchanged =
+            crate::update::unchanged_files(&previous_files, &manifest.files, &changed);
+        // A chunk is only already in place when every file that consumes it is unchanged. An
+        // add-on that shares a chunk with the main game still needs those bytes written at its own
+        // offsets, so a chunk consumed by a new file has to be fetched again.
+        //
+        // `unchanged` holds manifest paths, while `files` is keyed by the sanitised relative path,
+        // so match on the manifest path of each entry rather than on the key.
+        let mut consumed_by_new: HashSet<[u32; 4]> = HashSet::new();
+        for (_, meta) in &files {
+            if unchanged.contains(&meta.path) {
+                continue;
             }
+            for part in &meta.parts {
+                consumed_by_new.insert(part.guid);
+            }
+        }
+        let mut reused = 0usize;
+        for (index, chunk) in manifest.chunks.iter().enumerate() {
+            if !changed.contains(&chunk.guid) && !consumed_by_new.contains(&chunk.guid) {
+                done.insert(index, ());
+                reused += 1;
+            }
+        }
+        if reused > 0 {
             eprintln!(
-                "incremental: reusing {reusable} of {} chunk(s) already on disk",
+                "incremental: reusing {reused} of {} chunk(s) already on disk",
                 manifest.chunks.len()
             );
         }
-        let unchanged =
-            crate::update::unchanged_files(&previous_files, &manifest.files, &changed);
         if !unchanged.is_empty() {
             eprintln!(
                 "incremental: skipping verification of {} unchanged file(s)",
@@ -1146,17 +1346,30 @@ fn install_components_inner(
     }
 
     // Remove files a previous build shipped and this component no longer contains. Deletion is
-    // per component: files of an add-on that is not part of this run are never touched.
-    remove_obsolete_files(install_dir, &previous_components, components, &files);
+    // per component: files of an add-on that is not part of this run are never touched, and neither
+    // are the files of a preserved component (the main game, when only an add-on is being added).
+    remove_obsolete_files(
+        install_dir,
+        &previous_components,
+        components.get(preserve..).unwrap_or(&[]),
+        &files,
+    );
 
-    let guids = write_egstore_components(install_dir, components)?;
+    let guids = write_egstore_components(install_dir, components, preserve)?;
     let mut launcher_registered = false;
     let mut launcher_running = false;
     let mut launcher_error = None;
     if opts.register_launcher {
         // Registration is a convenience, not part of the install: a locked-down ProgramData must
         // not turn a finished install into a failure.
-        match register_with_launcher_components(components, &guids) {
+        //
+        // Only the components this run writes may have their existing launcher entry replaced: in
+        // an additive run the main game keeps the one it already has, and deleting it here would
+        // make the official launcher forget an install that is still on disk.
+        match register_with_launcher_components(
+            components.get(preserve..).unwrap_or(&[]),
+            &guids,
+        ) {
             Ok(()) => {
                 launcher_registered = true;
                 // Sampled after writing so the answer describes the state the user will observe.
@@ -1459,13 +1672,43 @@ fn write_component_metadata(
 fn write_egstore_components(
     install_dir: &Path,
     components: &[InstallComponent],
+    preserve: usize,
 ) -> Result<Vec<EgstoreEntry>> {
     let base = components
         .first()
         .ok_or_else(|| Error::usage("an install needs at least one component"))?;
-    let base_guid = generate_guid();
-    let mut entries: Vec<EgstoreEntry> = Vec::with_capacity(components.len());
-    for (index, component) in components.iter().enumerate() {
+    // In an additive run the main game keeps the identity it was installed with, so add-ons added
+    // later still point at the existing `InstallationGuid` instead of a GUID nothing else knows.
+    let base_guid = if preserve > 0 {
+        load_installed_components(install_dir)
+            .ok()
+            .and_then(|installed| installed.into_iter().find(|component| component.is_main_game()))
+            .map(|component| component.guid)
+            .unwrap_or_else(generate_guid)
+    } else {
+        generate_guid()
+    };
+
+    let mut entries: Vec<EgstoreEntry> =
+        Vec::with_capacity(components.len().saturating_sub(preserve));
+    let mut keep: HashSet<String> = HashSet::new();
+    // An additive run must not delete metadata it did not write: the main game's entry and every
+    // add-on an earlier run installed keep their files (and their launcher registration).
+    if preserve > 0 {
+        if let Ok(read) = std::fs::read_dir(install_dir.join(".egstore")) {
+            for entry in read.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if matches!(
+                    Path::new(&name).extension().and_then(|ext| ext.to_str()),
+                    Some("item" | "mancpn" | "manifest")
+                ) {
+                    keep.insert(name);
+                }
+            }
+        }
+    }
+
+    for (index, component) in components.iter().enumerate().skip(preserve) {
         let guid = if index == 0 { base_guid.clone() } else { generate_guid() };
         let is_dlc = index > 0;
         let item = write_component_metadata(
@@ -1476,25 +1719,22 @@ fn write_egstore_components(
             is_dlc,
             &base_guid,
         )?;
+        for extension in ["item", "mancpn", "manifest"] {
+            keep.insert(format!("{guid}.{extension}"));
+        }
         entries.push(EgstoreEntry {
             guid,
             app_name: component.game.app_name.clone(),
             item,
         });
     }
-    cleanup_egstore(install_dir, &entries)?;
+    cleanup_egstore(install_dir, &keep)?;
     Ok(entries)
 }
 
 /// Drop `.item/.mancpn/.manifest` files that do not belong to the metadata just written.
-fn cleanup_egstore(install_dir: &Path, entries: &[EgstoreEntry]) -> Result<()> {
+fn cleanup_egstore(install_dir: &Path, keep: &HashSet<String>) -> Result<()> {
     let egstore = install_dir.join(".egstore");
-    let mut keep: HashSet<String> = HashSet::new();
-    for entry in entries {
-        keep.insert(format!("{}.item", entry.guid));
-        keep.insert(format!("{}.mancpn", entry.guid));
-        keep.insert(format!("{}.manifest", entry.guid));
-    }
     let Ok(read) = std::fs::read_dir(&egstore) else { return Ok(()) };
     for entry in read.flatten() {
         let path = entry.path();
@@ -2272,7 +2512,7 @@ mod tests {
         let mut base = component("Base", 21, Vec::new(), Vec::new());
         // `find_existing_install` reads the manifest back, so the fixture must be a real one.
         base.raw = br#"{"ManifestFileVersion":"18","AppNameString":"Base"}"#.to_vec();
-        write_egstore_components(&dir, &[base]).unwrap();
+        write_egstore_components(&dir, &[base], 0).unwrap();
 
         assert_eq!(find_existing_install(&root, "Base"), Some(dir.clone()));
         assert!(find_existing_install(&root, "Other").is_none());
