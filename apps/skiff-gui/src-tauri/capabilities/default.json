@@ -1,7 +1,0 @@
-{
-  "$schema": "../gen/schemas/desktop-schema.json",
-  "identifier": "default",
-  "description": "Minimal capability set: only the core IPC surface is needed because all work happens in Rust commands.",
-  "windows": ["main"],
-  "permissions": ["core:default"]
-}

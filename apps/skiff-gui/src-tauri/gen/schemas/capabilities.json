@@ -1,1 +1,0 @@
-{"default":{"identifier":"default","description":"Minimal capability set: only the core IPC surface is needed because all work happens in Rust commands.","local":true,"windows":["main"],"permissions":["core:default"]}}

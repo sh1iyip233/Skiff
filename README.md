@@ -1,92 +1,75 @@
-# Skiff — 第三方 Epic 游戏下载器
+# Skiff
 
-用**你自己的 Epic 账号**读取游戏库，按你指定的并发线程数下载、校验并安装游戏，并写出
-`.egstore` 清单让官方启动器识别为“已安装”。
+一个用 Rust 写的第三方 Epic 游戏下载器（Windows）。
 
-> **非官方工具**。调用 Epic 启动器使用但未公开文档的接口，可能随 Epic 侧变更而失效。
-> 仅能下载你账号 entitlement 覆盖的内容（服务端强校验），不包含任何 DRM/反作弊绕过。
-> 请只在自有机器的自有账号上使用。
+主要解决官方启动器下载慢、并发调不了的问题：登录你自己的 Epic 账号，读取游戏库，按自己指定的线程数多线程下载、校验并安装游戏，同时生成 `.egstore` 文件，让官方启动器也能直接识别为已安装。
 
----
+> 声明：非官方工具，调用的是 Epic 启动器未公开的接口，官方改接口随时可能失效。只能下载你自己账号已拥有的游戏（服务端会校验权限），不包含任何 DRM 或反作弊绕过。建议只在自己的电脑和账号上用，风险自担。
 
-## 1. 能力范围
+## 都有什么功能
 
-| 能力 | 状态 |
-|---|---|
-| 设备码登录 / 浏览器授权码登录，token 自动刷新 | ✅ |
-| DPAPI 加密存储 token（当前用户作用域） | ✅ |
-| 读取 entitlement + library + catalog，合并出可安装游戏列表 | ✅ |
-| 按 catalog `mainGameItem` 把 DLC 归到主游戏，默认不再作为独立游戏显示 | ✅ |
-| 安装主游戏时可把已拥有的 DLC 合并进同一安装目录（`--no-dlc` 可关闭） | ✅ |
-| 解析 Epic 二进制 manifest（`0x44BEC00C`，含列式 CDL/FML）与 JSON 兜底 | ✅ |
-| 分块下载：用户指定并发、多 CDN host 轮转、连接复用 | ✅ |
-| 逐块 SHA-1 + rolling hash 校验，zlib / AES-GCM 解包 | ✅ |
-| 断点续传（续传账本）、`--repair` 只重下有问题的分块 | ✅ |
-| 写 `.egstore`（`.item` / `.mancpn` / `.manifest`），可选注册到官方启动器 | ✅ |
-| 图形界面 | ⏳ 见 §8 |
+- **三种使用方式**：
+  - 桌面客户端（Slint 自绘界面，`skiff-ui.exe`，不依赖 WebView2，不用管理员权限）
+  - 本地网页界面（`skiff serve --open`，浏览器里直接用）
+  - 命令行（`skiff.exe`）
+- **账号登录**：通过浏览器授权码登录，token 用 Windows DPAPI 按当前用户加密保存在本地，过期自动刷新。
+- **游戏库与 DLC 归组**：拉取游戏库，按 Epic 目录的 `mainGameItem` 自动把 DLC 归到对应主游戏下面，安装主游戏时会顺带把已拥有的 DLC 一起装进同一目录（加 `--no-dlc` 可关闭）。
+- **多线程分块下载**：自己定下载并发数，支持多 CDN 节点轮转、连接复用和自动剔除连不上的节点（比如国内经常超时的 Akamai 节点）。
+- **校验与续传**：支持断点续传、逐块 SHA-1 / rolling hash 校验、zlib 解包，文件坏了可以用 `--repair` 只重下损坏的分块。
+- **兼容官方启动器**：自动写出 `.egstore`（`.item` / `.mancpn` / `.manifest`），也可以选择注册到官方启动器。
 
----
+## 快速上手
 
-## 2. 构建
+### 图形界面
 
-需要 Rust（`rustup`）。Windows 上优先用 **GNU 目标**，因为它不需要安装 Visual Studio：
+编译好之后直接运行 `skiff-ui.exe` 即可，或者用命令行起一个本地网页版：
 
 ```powershell
-cargo build --release                                   # 有 MSVC 链接器时
-cargo +stable-x86_64-pc-windows-gnu build --release      # 没有 Visual Studio 时
+skiff serve --open
 ```
 
-产物：`target/release/skiff.exe`（单文件，无运行时不依赖）。
-
-> 若两个目标都不可用，先装 GNU 目标：`rustup target add x86_64-pc-windows-gnu`。
-> `scripts\build.ps1` 会自动挑选可用目标。
-
-设计上刻意**不依赖异步运行时与 TLS crate**：
-
-- HTTPS 由系统 WinHTTP 提供（每个工作线程复用一条会话/连接），因此不需要 OpenSSL/ring，
-  也不需要 MSVC 的 `dlltool` 流程；
-- 并发用 std 线程池，和“并发线程”语义一一对应；
-- 其余依赖（serde / sha1 / flate2 / brotli / aes-gcm）都是纯 Rust，可离线构建。
-
----
-
-## 3. 快速开始
+### 命令行
 
 ```powershell
-# 1) 登录：给出激活链接与 8 位代码，浏览器里确认即可
+# 1. 登录（按提示在浏览器打开链接，把拿到的 authorizationCode 填进来）
 skiff auth login
 
-# 2) 看游戏库（首次会拉取并缓存）
+# 2. 查看游戏库（首次会拉取并缓存）
 skiff library list
 skiff library list --search 赛博
 
-# 3) 看某款游戏的构建与体量
+# 3. 查看游戏体积和构建信息
 skiff info Fortnite
 
-# 4) 安装（默认 16 并发）
+# 4. 下载安装（-j 指定下载线程数，--limit-rate 限速）
 skiff install Fortnite -j 32 --limit-rate 80M
 
-# 5) 校验 / 修复
+# 5. 校验或修复已安装的游戏
 skiff verify "D:\Games\Fortnite"
 skiff verify "D:\Games\Fortnite" --repair
 ```
 
----
+> 注：Epic 的设备码登录（`--device-code`）目前不对 `launcherAppClient2` 开放，会直接返回 401，所以登录请走默认的浏览器授权码流程。
 
-## 3.1 主游戏与 DLC
+## DLC 处理
 
-`library list` 默认只显示主游戏，DLC 列显示已拥有的追加内容数量；`--all` 才平铺显示它们：
+`skiff library list` 默认只列出主游戏，后面标出已拥有的 DLC 数量；想全部摊开看就加 `--all`：
 
 ```powershell
-skiff library list                 # 主游戏 + DLC 数量
-skiff library list --all           # 主游戏和 DLC，DLC 行标注父游戏
-skiff library list --json          # 分组 JSON（games[].dlc[]）
+skiff library list            # 主游戏 + DLC 数量
+skiff library list --all      # 全部列出，DLC 会标明所属主游戏
+skiff library list --json     # 按主游戏分组输出 JSON
 ```
 
-关联依据是 Epic catalog 的 `mainGameItem`（DLC 的 catalog 条目会带上主条目），解析顺序为：
-catalog id → release appId → 标题唯一匹配 → 同命名空间唯一主游戏。没有 `mainGameItem` 的
-“额外内容”（例如某些 Bonus Content、Soundtrack、Wallpaper）默认保持独立；可用状态目录下的
-`parents.json` 手工归组：
+装主游戏时默认会把同组已拥有的 DLC 合并装到同一个目录里（官方启动器也是这么放的）。如果只装本体，加上 `--no-dlc`：
+
+```powershell
+skiff install "Cyberpunk 2077"                  # 主游戏 + 已拥有的 DLC
+skiff install "Cyberpunk 2077" --no-dlc         # 只装主游戏
+skiff install "Cyberpunk 2077: Phantom Liberty" # 会自动定位到主游戏
+```
+
+DLC 归组依赖 Epic 目录里的 `mainGameItem` 字段。有些额外内容（比如原声带、壁纸、Bonus Content）目录里没写这个字段，默认会单独列出来。如果想手动归到某个主游戏下面，可以在状态目录里新建一个 `parents.json`：
 
 ```json
 {
@@ -94,57 +77,36 @@ catalog id → release appId → 标题唯一匹配 → 同命名空间唯一主
 }
 ```
 
-键为 DLC 的 appName，值为主游戏 appName 或标题；改完执行一次 `skiff library list --refresh`。
+左边填 DLC 的 `appName`，右边填主游戏的 `appName` 或标题，保存后跑一次 `skiff library list --refresh` 生效。
 
-安装主游戏时默认把同组已拥有的 DLC 一并解析并写入**同一个安装目录**（Epic 的 DLC 本身就是这样
-覆盖到主游戏目录的）；只想要主游戏时加 `--no-dlc`：
+如果某个 DLC 拉取失败（比如没发布 Live 版本、manifest 加密或者网络报错），会打个警告跳过，不影响主游戏安装。主游戏和 DLC 如果有同路径但内容不同的文件，目前默认保留主游戏的版本。
+
+## 并发与限速
+
+下载线程数完全按你设定的来，程序不会偷偷帮你调高或调低。填超范围会直接报错（退出码 2），安装完后会打印实际峰值并发 `peak inflight` 供核对。
+
+| 参数 | 缩写 | 默认值 | 范围 | 说明 |
+|---|---|---|---|---|
+| `--concurrency` | `-j` | 16 | 1–128 | 同时下载的分块线程数 |
+| `--write-threads` | | 4 | 1–16 | 写盘线程数 |
+| `--verify-threads` | | `min(CPU, 8)` | 1–32 | 校验并发数 |
+| `--per-host` | | 不限 | 1–128 | 单个 CDN 域名的并发上限 |
+
+优先级为：命令行参数 > `config.toml` > 默认值。想改默认并发可以直接写进配置：
 
 ```powershell
-skiff install "Cyberpunk 2077"              # 主游戏 + Phantom Liberty / REDmod
-skiff install "Cyberpunk 2077" --no-dlc     # 只装主游戏
-skiff install "Cyberpunk 2077: Phantom Liberty"  # 自动解析到 Cyberpunk 2077
+skiff config set concurrency 32
 ```
 
-DLC 的构建解析失败（没有 Live 构建、加密 manifest、网络错误）只会告警并跳过，不会拖垮主游戏。
-同一路径出现不同内容时保留主游戏版本并告警。
+一般怎么调（Epic 分块大约 1 MiB 一块）：
+- 100M 宽带：`-j 8` 基本就够了
+- 500M 宽带：`-j 16`
+- 千兆宽带：`-j 32` 到 `64`，最好配上 `--per-host 16` 防止单个 CDN 节点限速
+- 不是越大越好，开太高容易撞 CDN 的 429 限流，看日志里重试多不多来微调就行
 
----
+## 全部命令
 
-## 4. 并发线程（核心约定）
-
-并发是**你定义的硬契约**，引擎不做任何“聪明”的自适应升降。
-
-| 参数 | 别名 | 默认 | 范围 | 含义 |
-|---|---|---|---|---|
-| `--concurrency` | `-j` | 16 | 1–128 | 同时在途的分块下载线程数 |
-| `--write-threads` |  | 4 | 1–16 | 落盘写入线程数 |
-| `--verify-threads` |  | `min(CPU,8)` | 1–32 | 校验阶段并发文件数 |
-| `--per-host` |  | 不限 | 1–128 | 单个 CDN host 的在途上限 |
-
-规则：
-
-1. **优先级**：命令行显式参数 > `config.toml` > 内置默认。
-2. **越界即报错**（退出码 2），不会静默裁剪。
-3. 稳态下在途请求数**恰好等于** `-j`（有测试断言，`peak_inflight` 会打印出来自证）。
-4. 安装结束后会打印 `peak inflight: N (configured M)`，两者应一致。
-5. 持久化：`skiff config set concurrency 32`。
-
-调参建议（1 MiB 分块）：
-
-```
-吞吐 ≈ 并发数 × 1 MiB / RTT
-```
-
-- 100 Mbps 链路：`-j 8` 足够；
-- 500 Mbps：`-j 16`；
-- 千兆：`-j 32~64`，并配合 `--per-host 16` 避免单 host 被限速；
-- 并发不是越大越好：过高会触发 CDN 429，看日志里的重试次数再调。
-
----
-
-## 5. 命令一览
-
-```
+```text
 skiff auth login [--device-code | --code <authorizationCode>]
 skiff auth logout | status
 skiff library list [--search <text>] [--all] [--refresh] [--json]
@@ -155,211 +117,98 @@ skiff install <appName> [-j N] [--write-threads N] [--per-host N] [--limit-rate 
 skiff verify <installDir> [--repair]
 skiff uninstall <installDir> [--keep-files]
 skiff config get | set <key> <value> | list
+skiff serve [--port <n>] [--open]
 skiff debug manifest <file> [--json]
 skiff debug cdn-probe <appName>
 ```
 
-全局：`--json`、`--no-progress`。退出码：`0` 成功、`1` 运行错误、`2` 用法错误、`130` 中断。
+全局参数：`--json`、`--no-progress`。退出码：`0` 正常、`1` 运行出错、`2` 参数错误、`130` 手动中断。
 
-`--dir` 指向**父目录**时会自动追加游戏的 `FolderName`；要精确指定安装目录请直接用目标路径
-（目录名即安装目录）。
+`--dir` 如果传的是上级目录（比如 `D:\Games`），会自动拼上游戏的文件夹名；想装到指定目录就直接写完整路径。
 
----
+## 文件位置与目录结构
 
-## 6. 目录与状态文件
+配置和缓存默认放在 `%LOCALAPPDATA%\Skiff`（如果不可写会自动往 `%APPDATA%`、`%TEMP%`、`./.Skiff` 降级，也可以通过环境变量 `SKIFF_HOME` 指定固定目录，CLI 和 GUI 设成同一个值就会共享登录态）。从旧版 `epicd` 升级时会自动迁移目录。
 
-状态目录默认是 `%LOCALAPPDATA%\Skiff`。从旧版本升级时，首次运行会自动把
-`%LOCALAPPDATA%\epicd` 迁移过来（优先整目录改名，被占用时复制登录与缓存文件），
-登录态和游戏库缓存不会丢失；也可以用 `SKIFF_HOME` 固定位置。
-
-```
+```text
 %LOCALAPPDATA%\Skiff\
-├── config.toml        配置（并发、安装根目录、CDN 偏好等）
-├── auth.json          账号 token（DPAPI 加密；损坏就重新 login）
-├── games.json         游戏列表缓存（schema 2，含 DLC 关联字段）
-├── titles.json        代号标题的本地覆盖缓存
-└── parents.json       可选的 DLC→主游戏手工覆盖
+├── config.toml        配置文件（并发、默认安装目录等）
+├── auth.json          登录凭证（DPAPI 加密，损坏删掉重新登录即可）
+├── games.json         游戏库缓存
+├── titles.json        代号标题的本地缓存
+└── parents.json       手动设置的 DLC 归组（可选）
 
-<install_dir>\
+<游戏安装目录>\
 ├── .egstore\
-│   ├── <GUID>.item       官方启动器格式的安装清单（主游戏和每个 DLC 各一套）
-│   ├── <GUID>.mancpn     安装对比信息
+│   ├── <GUID>.item       官方启动器识别用的清单（主游戏和各 DLC 各一份）
+│   ├── <GUID>.mancpn     安装对照信息
 │   ├── <GUID>.manifest   原始 manifest 备份
-│   ├── skiff.files       本次安装会写入的文件清单（成功后自动删除）
-│   └── skiff.resume      续传账本（成功后自动删除）
+│   ├── skiff.files       本次安装写入的文件列表（装完自动删）
+│   └── skiff.resume      断点续传记录（装完自动删）
 └── ...游戏文件...
 ```
 
-合并安装时，DLC 的 `.item` 里 `MainGameAppName` 指向主游戏、`InstallLocation` 与主游戏相同，
-`bIsApplication` / `bIsExecutable` 为 `false`；主游戏和 DLC 的文件都写在同一目录。
+删掉 `.egstore` 后官方启动器就认不出这个游戏了；用 `skiff uninstall` 卸载时会一并清理 `.egstore` 和 `%ProgramData%\Epic\EpicGamesLauncher\Data\Manifests\` 里对应的 `.item`。
 
-删除 `.egstore` 会让官方启动器不再识别该安装；`skiff uninstall` 会清理全部组件的
-`.egstore` 以及 `%ProgramData%\Epic\EpicGamesLauncher\Data\Manifests\<GUID>.item`。
+**关于暂停和取消**：
+- **暂停**（命令行按 `Ctrl-C` 也是这个效果）：停掉下载，保留已经下好的文件和续传记录，下次接着下。
+- **取消**（桌面版提供）：停掉下载，并删掉本次安装新写入的文件（只删 `skiff.files` 里记的路径，不动目录里原本就有的文件）。
 
-**暂停 vs 取消**（GUI 的两个按钮）：
+## 编译构建
 
-| 操作 | 行为 |
-|---|---|
-| 暂停 | 停止下载，保留已下载分块与续传账本；再点「继续安装」从断点继续 |
-| 取消 | 停止下载，并删除本次安装写入的文件（只删 `skiff.files` 列出的路径，不会动目录里的其他文件；若该目录已有完整安装则保留原文件） |
+需要 Rust（`rustup`）。Windows 上直接跑仓库里的构建脚本最省事（默认走 GNU 工具链 + `rust-lld`，不需要装 Visual Studio）：
 
-`skiff serve` 的网页界面只有「暂停」；命令行按 `Ctrl-C` 等同暂停。
-
----
-
-## 7. 工作原理
-
-```
-设备码/授权码 → TokenSet(DPAPI)
-      ↓
-entitlements + library + catalog(mainGameItem) → GameEntry(appName/namespace/catalogItemId/is_dlc/parent)
-      ↓
-library_view：主游戏 + 已拥有 DLC 分组（无父的 DLC 单独标记，不冒充游戏）
-      ↓
-安装主游戏：逐个解析 DLC 构建 → 合并 files[]/chunks[]（去重、主游戏优先）→ 单一并发计划
-      ↓
-launcher assets v2 → manifest URI + CDN base URLs（多 host 并集）
-      ↓
-binary manifest → chunks[] + files[]（列式解析，逐块记录 feature level）
-      ↓
-N 个下载线程：GET chunk → SHA-1/rolling hash 校验 → zlib/AES-GCM 解包
-      ↓ 逐 part
-预分配文件 + seek_write 定位写入（多 writer 线程）
-      ↓
-按文件 SHA-1 校验 → 每组件写 .egstore → （可选）注册启动器
+```powershell
+.\scripts\build.ps1        # 编译 CLI -> target/release/skiff.exe
+.\scripts\build-gui.ps1    # 编译 Slint 桌面端 -> target/release/skiff-ui.exe
 ```
 
-关键实现点：
+也可以直接用 Cargo：
 
-- **分块即工作单元**：Epic CDN 的 chunk 是内容寻址的独立对象，并发天然安全；
-- **连接复用**：每个下载线程持有一条 WinHTTP 会话，握手只付一次；
-- **多 host 轮转**：Akamai/Fastly 多个域名分摊，实测可显著提升聚合吞吐；
-- **去重**：同一 chunk 被多个文件引用时只下一次（写入时扇出到各偏移）；
-- **原子状态**：账本与配置用“临时文件 + rename”写入，断电不会写坏。
+```powershell
+cargo build --release                                   # 本机有 MSVC 时
+cargo +stable-x86_64-pc-windows-gnu build --release     # 用 GNU 工具链
+```
 
----
+如果缺 GNU 目标，先装一下：`rustup target add x86_64-pc-windows-gnu`。脚本依赖 MinGW 的 `dlltool`、`x86_64-pc-windows-gnu` 工具链和 `rust-lld`。
 
-## 8. 图形界面（Tauri）
+为了打包干净、不折腾 OpenSSL / MSVC 链接，代码里没有引入 tokio 或第三方 TLS 库：HTTPS 直接调系统自带的 WinHTTP（每个下载线程复用一条连接），并发直接用标准库线程池，其余加密和压缩依赖都是纯 Rust。
 
-方案已确定为 CLI + Tauri GUI，`skiff-core` 是两者的公共内核，GUI 只做薄适配层。
-当前仓库先交付 CLI：**构建环境无法访问 crates.io 之外的包源，Tauri 的依赖树（tauri /
-windows-sys）与前端 npm 依赖都无法在此环境拉取与验证**，与其交付一个编译不过的壳，
-不如先把可验证的内核与 CLI 做完。
-
-GUI 落地时只需：
-
-1. `apps/skiff-gui/src-tauri` 依赖 `skiff-core`，把 `install_manifest`/`download` 跑在
-   `tauri::async_runtime::spawn_blocking` 中；
-2. 通过 `Progress` 回调 `app.emit("download://progress", …)`（约 5 Hz 节流）；
-3. 并发控件直接读写 `Concurrency`，与 CLI 完全同一套校验规则。
-
----
-
-## 9. 测试
+## 跑测试
 
 ```powershell
 cargo +stable-x86_64-pc-windows-gnu test -p skiff-core --offline
 ```
 
-覆盖：
+包含 manifest 解析、分块校验与解压、CDN 路径拼接与轮转、路径穿越检查、并发数验证、DLC 归组，以及基于本地假 CDN 的端到端安装/续传/修复/卸载测试。
 
-- **清单格式**：二进制往返（含 UTF-16 字段）、JSON 兜底、损坏检测、分块索引；
-- **分块容器**：压缩/未压缩解析、魔数校验、篡改检测、加密块无密钥时报错；
-- **CDN**：用真实抓到的 URL 断言路径模板（`ChunksV4/07/…`、`ChunksV4/54/…`）、host 轮转；
-- **路径安全**：穿越、盘符、UNC、Windows 保留名、尾点空格；
-- **并发契约**：`-j 6` 时峰值在途 = 6，`-j 1` 时串行；
-- **DLC 关联**：catalog `mainGameItem` 解析、父游戏 id/app/标题/命名空间匹配、孤儿 DLC、手工覆盖；
-- **端到端**（本地假 CDN）：完整安装、`.egstore` 产物、独立复验、续传不重下、修复只重下损坏块、
-  多 host 轮转、损坏分块被拒、主游戏 + DLC 合并安装与联合卸载。
+## 目前的限制和已知问题
 
----
+1. **不支持加密 manifest / 加密 chunk（feature level ≥ 22）**：遇到会直接报错提示改用官方启动器。
+2. **还不支持增量更新**：目前每次 `install` 都是全量校验/下载，还没利用 `.mancpn` 做差异更新。
+3. **部分游戏名显示为内部代号**：比如 `Cyberpunk 2077` 在目录里可能只拿到代号 `Ginger`，个别条目会显示无商店信息，后续需要补查询逻辑。
+4. **注册到官方启动器需要管理员权限**：因为要写 `%ProgramData%`，没权限时会提示失败，但不影响游戏文件本身。
+5. **反作弊 / EOS 依赖**：本工具只管下载安装，有些游戏不开官方启动器还是进不去。
+6. **只测了 Windows**：Linux/macOS 能编译，但没接 HTTPS 后端，目前没法直接下 Epic 的东西。
+7. **只买了 DLC 没买本体**：`library list --all` 能看到，但无法单独安装。
+8. **中途强退的进度损耗**：续传记录每 64 个分块刷一次盘，按 `Ctrl-C` 最多重下不到 64 MiB。
+9. **官方启动器对合并 DLC 的识别**：`.item` 字段是照着官方样本拼的，万一启动器把某个 DLC 标成未安装，一般不影响主游戏正常游玩。
 
-## 10. 已知限制
+<details>
+<summary>开发备忘：实测踩过的 Epic 接口坑</summary>
 
-1. **feature level ≥ 22 的加密 manifest / 加密 chunk**：当前会明确报错并提示用官方启动器。
-   支持它需要从资产接口拿 `encryptionKey` 并用 AES-GCM 解 manifest 头部字段，是下一步工作。
-2. **注册到官方启动器**需要写 `%ProgramData%`，非管理员会失败（会给出提示，不影响已安装文件）。
-3. **反作弊/EOS 游戏**：本工具只负责下载安装；部分游戏脱离官方启动器仍无法运行。
-4. `Ctrl-C` 中断最多丢失最近一次账本落盘（每 64 块一次）的进度，重启后重下的量小于 64 MiB。
-5. 只在 Windows 上测试；Linux/macOS 可编译（走 plain HTTP 后端），但 Epic 的 HTTPS 需要额外 TLS 方案。
-6. **DLC 归组只以 Epic catalog 的 `mainGameItem` 为准**；目录里没有该字段的额外内容
-   （部分 Bonus Content / Soundtrack / Wallpaper）默认仍是独立条目，需要 `parents.json` 手工归组。
-7. **只拥有 DLC、没有主游戏**的条目不会安装：`library list --all` 可见，`install` 会明确报错。
-8. 主游戏与 DLC 出现**同路径不同内容**时保留主游戏版本并告警；这属于少数游戏的覆盖差异，
-   若遇到需要以 DLC 版本为准的情况，当前没有逐游戏覆盖规则。
-9. 官方启动器对合并安装中 DLC `.item` 的识别是 best-effort（字段依据现有 `.item` 样本推断）；
-   即使启动器把某个 DLC 显示为未安装，主游戏文件和运行不受影响。
+- `/oauth/deviceAuthorization` 对 `launcherAppClient2` 返回 401，必须用 `authorizationCode`。
+- 业务接口的 `Authorization` 请求头必须带 `bearer ` 前缀。
+- token 响应里的 `scope` 是字符串数组，刷新过期时间字段叫 `refresh_expires`。
+- 旧的 `/entitlement/.../entitlements` 路由会 404，现在改从 `launcher/api/public/assets` 拿 `appName`。
+- 国内网络下 `akamaized.net` 经常 12002 超时，所以安装前会先探活把不通的节点踢掉。
+- `catalog bulk/items` 必须带 `country` 和 `locale`，不然大部分条目不给标题；而且多个 id 必须写成重复参数 `id=a&id=b`，用逗号拼成 `id=a,b` 会直接返回空 `{}`。
+- `mainGameItem` 才是 DLC 指向主游戏的字段，`mainGameItemList` 是合集里包含的内容。
 
----
+</details>
 
-## 11. 许可与致谢
+## 致谢与协议
 
-本项目源码为 MIT。
+代码采用 MIT 协议开源。
 
-Epic 的启动器接口没有公开文档，本项目实现所依据的**协议事实**（OAuth 授权流程、资产 v2 端点、
-二进制 manifest 的列式布局、chunk 容器头、CDN 路径模板、`.egstore` 字段集）是在开发期参照社区
-开源项目 [legendary](https://github.com/legendary-gl/legendary)（GPL-3.0）的实际行为与公开讨论
-交叉核对的——只借鉴**事实与格式**，没有任何 Python 代码被移植或复制，Rust 侧实现均为独立编写。
-若你分发本项目，请自行评估所在司法辖区的合规要求。
-
-使用风险自担，详见文首声明。
-
----
-
-## 12. 当前状态与实测结论（v0.2）
-
-### 已用真实账号、真实 CDN 验证
-
-| 项目 | 结果 |
-|---|---|
-| 授权码登录 | ✅ 绿道验证（设备码不可用，见下表） |
-| 游戏库 | ✅ 165 条记录 → **132 款主游戏 + 33 个 DLC**（含 Cyberpunk 2077 的 `Ginger`） |
-| DLC 关联 | ✅ Cyberpunk 2077 +2、Civ VI +9、Model Builder Complete Edition +10、Outer Worlds +2、Dying Light +2 等按 `mainGameItem` 归组 |
-| 构建解析 | ✅ The Bridge `Sunbird`；Cyberpunk `Ginger` → manifest level 21 / 113,209 chunks / 110.93 GiB；Phantom Liberty → 30.10 GiB / 37 files |
-| 实际安装 | ✅ The Bridge：344.40 MiB、159 文件、峰值并发 48/48、21.4s（≈16 MiB/s）、`verify` 159/159 clean |
-| 合并安装 | ✅ 假 CDN 端到端：主游戏 + DLC 同目录、双 `.item`、共享 chunk 去重、联合 `verify`/`uninstall` |
-| `.egstore` | ✅ `.item` 1741 B / `.mancpn` 161 B / `.manifest` 38,147 B；DLC 项 `MainGameAppName` 指向主游戏 |
-| 并发契约 | ✅ `peak inflight` 严格等于设定值（1/16/48/128 均验证） |
-
-### Epic 接口实测（避免重复踩坑）
-
-| 现象 | 结论 |
-|---|---|
-| `/oauth/deviceAuthorization` → 401 | 设备码流程**不对 `launcherAppClient2` 开放**，必须用 `authorizationCode` |
-| 所有业务接口 → 401 | `Authorization` 头必须带 **`bearer `** 前缀 |
-| token 响应解析失败 | `scope` 是**字符串数组**，且刷新时长字段名是 `refresh_expires` |
-| `/entitlement/.../entitlements` → 404 | 路由已变更；改为从 `launcher/api/public/assets` 推导 appName |
-| CDN 三主机只有一个通 | 国内网络下 `akamaized.net` 常 12002 超时；安装前探活剔除 |
-| `catalog bulk/items` 无标题 | 必须带 `country`/`locale`，否则多数条目只返回 id |
-| `catalog bulk/items` 多 id 返回 `{}` | id 必须写成重复参数 `id=a&id=b`；逗号拼接 `id=a,b` 会被静默当成空结果 |
-| `mainGameItem` | DLC 条目带父游戏详情；`mainGameItemList` 是合集内容，不是父指针 |
-
-### 环境适配（本机踩到的坑）
-
-- **状态目录**自动降级：`%LOCALAPPDATA%` → `%APPDATA%` → `%TEMP%` → `./.Skiff`（本机 `AppData\Local` 对非管理员不可写）
-- **安装根目录**不可写时提示并兜底，绝不静默改用相对路径
-- **授权码登录先探测可写性**，避免白烧一次性 code
-- `SKIFF_HOME` 可固定状态位置；CLI 与 GUI 需用同一个值才共享登录态
-
-### 构建
-
-```powershell
-.\scripts\build.ps1        # CLI（自动加载 dlltool + rust-lld）
-.\scripts\build-gui.ps1    # GUI（Slint）
-```
-
-三个必需条件（缺一不可，脚本已固化）：MinGW `dlltool` 在 PATH、`RUSTUP_TOOLCHAIN=…-gnu`、`RUSTFLAGS=-C linker=rust-lld`。
-
-### 三个界面
-
-| 形态 | 路径 | 特点 |
-|---|---|---|
-| **Slint 原生窗口（主推）** | `apps/skiff-slint` → `skiff-ui.exe`（12.6 MiB） | 自绘、无 WebView2、**免管理员**、启动快 |
-| 浏览器 GUI | `skiff serve --open` | 零依赖，任何机器可用，功能与上面一致 |
-| Tauri（已弃用） | `apps/skiff-gui` | 已从 workspace 排除；在本机需管理员权限，仅留作参考 |
-
-### 已知未完成
-
-1. **标题/FolderName 补全**：`Ginger` 显示为代号而非 `Cyberpunk 2077`；34 条显示「（无商店信息）」。需要按 offer/productSlug 兜底查询。
-2. **增量更新**：每次 `install` 全量重下；`.mancpn` 已写入但未用于差异下载。
-3. manifest feature level **≥22**（ChunksV5 加密）仍不支持，会明确报错。
+Epic 启动器的接口没有官方文档，开发时对照了开源项目 [legendary](https://github.com/legendary-gl/legendary)（GPL-3.0）的行为和社区资料来确认 OAuth 流程、manifest 结构、chunk 格式、CDN 路径规则和 `.egstore` 字段。本项目只参考了协议格式，Rust 代码全部重写，没有复制或移植任何 Python 代码。

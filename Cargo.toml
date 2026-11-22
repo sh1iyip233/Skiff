@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/skiff-core", "crates/skiff-cli", "apps/skiff-slint"]
-exclude = ["tools/cargo-probe", "apps/skiff-gui/src-tauri"]
+exclude = ["tools/cargo-probe"]
 
 [workspace.package]
 version = "0.1.0"
