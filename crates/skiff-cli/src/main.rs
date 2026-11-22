@@ -34,6 +34,7 @@ USAGE:
                          [--register-launcher] [-y]
   skiff verify <installDir> [--repair]
   skiff uninstall <installDir> [--keep-files]
+  skiff register <installDir>
   skiff config get | set <key> <value> | list
   skiff serve [--port <n>] [--open]
   skiff debug manifest <file> [--json]
@@ -162,6 +163,7 @@ fn run() -> Result<()> {
         Some("install") => cmd_install(&args, &cfg, json),
         Some("verify") => cmd_verify(&args, &cfg),
         Some("uninstall") => cmd_uninstall(&args, &cfg),
+        Some("register") => cmd_register(&args),
         Some("config") => cmd_config(&args, &cfg),
         Some("serve") => cmd_serve(&args, &cfg),
         Some("debug") => cmd_debug(&args, &cfg, json),
@@ -726,6 +728,24 @@ fn cmd_uninstall(args: &Args, cfg: &Config) -> Result<()> {
         .unwrap_or_default();
     install::uninstall(&dir, args.has("keep-files"), &app)?;
     println!("removed install metadata from {}", dir.display());
+    Ok(())
+}
+
+/// Re-register an existing install with the official launcher.
+///
+/// The launcher deletes registrations it does not consider its own, so an install can lose its
+/// entry without the files changing; this rewrites both launcher stores from `.egstore`.
+fn cmd_register(args: &Args) -> Result<()> {
+    let dir = PathBuf::from(args.required(1, "install directory")?);
+    install::register_install(&dir)?;
+    println!("registered {} with the Epic Games Launcher", dir.display());
+    if skiff_core::launcher::launcher_running() {
+        println!(
+            "  提示        : Epic 启动器正在运行，请从托盘完全退出后重新打开，游戏才会出现在库里。"
+        );
+    } else {
+        println!("  提示        : 下次打开 Epic 启动器就能在库里看到这个游戏。");
+    }
     Ok(())
 }
 

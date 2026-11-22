@@ -11,6 +11,7 @@
 //! * [`cdn`]    – manifest/chunk URL construction and CDN host rotation.
 //! * [`download`] – user-bounded thread pool, writer fan-out, rate limiting, progress.
 //! * [`install`] – install/verify/repair orchestration plus `.egstore` metadata writing.
+//! * [`launcher`] – registering an install with the official Epic Games Launcher.
 
 pub mod api;
 pub mod auth;
@@ -21,6 +22,7 @@ pub mod download;
 pub mod error;
 pub mod http;
 pub mod install;
+pub mod launcher;
 pub mod library;
 pub mod manifest;
 pub mod net;

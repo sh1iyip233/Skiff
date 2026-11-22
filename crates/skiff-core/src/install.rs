@@ -1156,11 +1156,15 @@ fn install_components_inner(
     if opts.register_launcher {
         // Registration is a convenience, not part of the install: a locked-down ProgramData must
         // not turn a finished install into a failure.
-        match register_with_launcher_components(components, &guids) {
+        let entries: Vec<crate::launcher::Entry<'_>> = guids
+            .iter()
+            .map(|entry| crate::launcher::Entry { guid: &entry.guid, item: &entry.item })
+            .collect();
+        match crate::launcher::register(&entries) {
             Ok(()) => {
                 launcher_registered = true;
                 // Sampled after writing so the answer describes the state the user will observe.
-                launcher_running = epic_launcher_running();
+                launcher_running = crate::launcher::launcher_running();
             }
             Err(error) => {
                 launcher_error = Some(error.to_string());
@@ -1533,89 +1537,25 @@ fn write_egstore(
     Ok(())
 }
 
-fn launcher_manifests_dir() -> PathBuf {
-    let program_data = std::env::var("ProgramData").unwrap_or_else(|_| "C:\\ProgramData".into());
-    Path::new(&program_data)
-        .join("Epic")
-        .join("EpicGamesLauncher")
-        .join("Data")
-        .join("Manifests")
-}
-
-/// True when an Epic Games Launcher process is running.
+/// Register an existing install with the official launcher.
 ///
-/// The launcher reads `%ProgramData%\Epic\EpicGamesLauncher\Data\Manifests\*.item` only when it
-/// starts (`LogItemFiles`/`LoadItemFiles` in `EpicGamesLauncher.exe`), so an install registered
-/// while it is running stays invisible until it is fully exited. Closing the window is not enough:
-/// the launcher keeps running in the notification area.
-pub fn epic_launcher_running() -> bool {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        let output = std::process::Command::new("tasklist")
-            .args(["/FI", "IMAGENAME eq EpicGamesLauncher.exe", "/NH", "/FO", "CSV"])
-            .creation_flags(CREATE_NO_WINDOW)
-            .output();
-        match output {
-            Ok(output) => String::from_utf8_lossy(&output.stdout)
-                .to_ascii_lowercase()
-                .contains("epicgameslauncher.exe"),
-            // Without a reliable answer stay quiet rather than nag about a restart.
-            Err(_) => false,
-        }
+/// Reads the `.item` metadata written by the original install, so no manifest is fetched and no
+/// file is touched. This is the repair path for an install whose launcher registration was lost
+/// (the launcher deletes registrations the EOS install helper does not report).
+pub fn register_install(install_dir: &Path) -> Result<()> {
+    let components = load_installed_components(install_dir)?;
+    let entries: Vec<crate::launcher::Entry<'_>> = components
+        .iter()
+        .filter(|component| component.item.is_object())
+        .map(|component| crate::launcher::Entry { guid: &component.guid, item: &component.item })
+        .collect();
+    if entries.is_empty() {
+        return Err(Error::usage(format!(
+            "{} has no .item metadata to register; reinstall it with skiff",
+            install_dir.display()
+        )));
     }
-    #[cfg(not(windows))]
-    {
-        false
-    }
-}
-
-/// Copy every component's `.item` where the official launcher looks for installed apps.
-fn register_with_launcher_components(
-    components: &[InstallComponent],
-    entries: &[EgstoreEntry],
-) -> Result<()> {
-    let manifests = launcher_manifests_dir();
-    if !manifests.exists() {
-        std::fs::create_dir_all(&manifests).map_err(|e| {
-            Error::integrity(format!(
-                "cannot create {} ({e}); run skiff as administrator or drop --register-launcher",
-                manifests.display()
-            ))
-        })?;
-    }
-
-    // Remove stale registrations for these apps before writing the new ones, so a reinstall does not
-    // leave two `.item` files describing the same game.
-    let app_set: HashSet<String> =
-        components.iter().map(|component| component.game.app_name.to_lowercase()).collect();
-    if let Ok(read) = std::fs::read_dir(&manifests) {
-        for entry in read.flatten() {
-            let path = entry.path();
-            if !path.extension().map(|ext| ext == "item").unwrap_or(false) {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(&path) else { continue };
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else { continue };
-            let app = value
-                .get("AppName")
-                .and_then(|v| v.as_str())
-                .unwrap_or_default()
-                .to_lowercase();
-            if app_set.contains(&app) {
-                let _ = std::fs::remove_file(&path);
-            }
-        }
-    }
-
-    for entry in entries {
-        let bytes = serde_json::to_vec_pretty(&entry.item)
-            .map_err(|e| Error::integrity(format!("cannot serialize launcher manifest: {e}")))?;
-        util::atomic_write(&manifests.join(format!("{}.item", entry.guid)), &bytes)?;
-    }
-    Ok(())
+    crate::launcher::register(&entries)
 }
 
 /// One installed component read back from `.egstore`.
@@ -1866,47 +1806,15 @@ pub fn uninstall(install_dir: &Path, keep_files: bool, app_name: &str) -> Result
         // Without an app name there is nothing we can safely identify in ProgramData.
         return Ok(());
     }
-    let app_set: HashSet<String> = components
+    let mut app_set: HashSet<String> = components
         .iter()
         .map(|component| component.app_name.to_lowercase())
         .filter(|name| !name.is_empty())
         .collect();
-    let install_text = install_dir.to_string_lossy().trim_end_matches('\\').to_lowercase();
-    let launcher_manifests = launcher_manifests_dir();
-    if let Ok(entries) = std::fs::read_dir(&launcher_manifests) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !path.extension().map(|e| e == "item").unwrap_or(false) {
-                continue;
-            }
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
-                    let item_app = value
-                        .get("AppName")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_lowercase();
-                    let item_main = value
-                        .get("MainGameAppName")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .to_lowercase();
-                    let item_location = value
-                        .get("InstallLocation")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or_default()
-                        .trim_end_matches('\\')
-                        .to_lowercase();
-                    let same_install = !install_text.is_empty() && item_location == install_text;
-                    if app_set.contains(&item_app)
-                        || (same_install && item_main == base_app.to_lowercase())
-                    {
-                        let _ = std::fs::remove_file(&path);
-                    }
-                }
-            }
-        }
-    }
+    app_set.insert(base_app.to_lowercase());
+    // Drops both the `.item` files and the EOSH installation records; the latter are what a 20.x
+    // launcher actually consults, and leaving them behind makes it re-add the install.
+    let _ = crate::launcher::unregister(&app_set);
     Ok(())
 }
 
