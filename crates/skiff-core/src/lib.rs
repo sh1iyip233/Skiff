@@ -9,6 +9,7 @@
 //! * [`manifest`] – Epic binary manifest parser (magic `0x44BEC00C`) with JSON fallback.
 //! * [`chunk`]  – chunk container decoding (zlib / AES-GCM) and integrity checks.
 //! * [`cdn`]    – manifest/chunk URL construction and CDN host rotation.
+//! * [`disk`]   – free-space queries for an install target volume.
 //! * [`download`] – user-bounded thread pool, writer fan-out, rate limiting, progress.
 //! * [`install`] – install/verify/repair orchestration plus `.egstore` metadata writing.
 //! * [`launcher`] – registering an install with the official Epic Games Launcher.
@@ -18,6 +19,7 @@ pub mod auth;
 pub mod cdn;
 pub mod chunk;
 pub mod config;
+pub mod disk;
 pub mod download;
 pub mod error;
 pub mod http;

@@ -656,6 +656,129 @@ fn resolve_component(api: &Api<'_>, game: &GameEntry) -> Result<InstallComponent
     Ok(InstallComponent { game: game.clone(), build, manifest, raw })
 }
 
+// ---------------------------------------------------------------------------------------------
+// pre-download size estimate
+// ---------------------------------------------------------------------------------------------
+
+/// Size of one install variant: the main game alone, or the main game plus its add-ons.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallSizes {
+    /// Total size of the files the finished install contains.
+    pub install_bytes: u64,
+    /// Bytes that still have to be allocated under the target directory.
+    pub needed_bytes: u64,
+}
+
+/// What an install would cost, resolved before any game content is downloaded.
+#[derive(Debug, Clone)]
+pub struct SpacePreview {
+    /// Directory the estimate was computed for.
+    pub target_dir: PathBuf,
+    /// The main game alone.
+    pub base_only: InstallSizes,
+    /// The main game plus every owned add-on that could be resolved.
+    pub with_dlc: InstallSizes,
+    /// Add-ons that could not be resolved; the real install skips them the same way.
+    pub skipped_dlc: Vec<String>,
+}
+
+/// Resolve the build and manifest of `base` and its add-ons and report the disk cost.
+///
+/// This mirrors what [`install_bundle`] does before its first write, without downloading any game
+/// content: the main game must resolve, an add-on that cannot be resolved is reported in
+/// [`SpacePreview::skipped_dlc`] and left out of [`SpacePreview::with_dlc`]. Both variants share the
+/// resolution of the main game, so a front end can flip between them without another round trip.
+pub fn preview_install_sizes(
+    api: &Api<'_>,
+    base: &GameEntry,
+    dlcs: &[GameEntry],
+    install_dir: &Path,
+) -> Result<SpacePreview> {
+    let mut components = vec![resolve_component(api, base)?];
+    let mut skipped_dlc: Vec<String> = Vec::new();
+    for dlc in dlcs {
+        if dlc.app_name.eq_ignore_ascii_case(&base.app_name) {
+            continue;
+        }
+        if components
+            .iter()
+            .any(|component| component.game.app_name.eq_ignore_ascii_case(&dlc.app_name))
+        {
+            continue;
+        }
+        match resolve_component(api, dlc) {
+            Ok(component) => components.push(component),
+            Err(e) => {
+                eprintln!(
+                    "warning: skipping DLC {} ({}): {e}",
+                    if dlc.title.is_empty() { &dlc.app_name } else { &dlc.title },
+                    dlc.app_name
+                );
+                skipped_dlc.push(dlc.app_name.clone());
+            }
+        }
+    }
+
+    let base_only = sizes_for(&components[..1], install_dir)?;
+    let with_dlc = if components.len() > 1 {
+        sizes_for(&components, install_dir)?
+    } else {
+        base_only.clone()
+    };
+
+    Ok(SpacePreview {
+        target_dir: install_dir.to_path_buf(),
+        base_only,
+        with_dlc,
+        skipped_dlc,
+    })
+}
+
+/// Merged install cost of one component set under `install_dir`.
+fn sizes_for(components: &[InstallComponent], install_dir: &Path) -> Result<InstallSizes> {
+    let plan = merge_components(components)?;
+    let install_bytes = plan.manifest.install_size();
+    let on_disk = bytes_on_disk(&plan.manifest, install_dir);
+    Ok(InstallSizes {
+        install_bytes,
+        needed_bytes: install_bytes.saturating_sub(on_disk),
+    })
+}
+
+/// Bytes already provisioned for the files `manifest` would write.
+///
+/// Files are preallocated to their full size before a download starts, so counting
+/// `min(current length, planned length)` is exactly what still has to be allocated: a file that will
+/// shrink contributes nothing, and a path that does not exist yet contributes zero.
+fn bytes_on_disk(manifest: &Manifest, install_dir: &Path) -> u64 {
+    let mut total = 0u64;
+    for file in &manifest.files {
+        let Ok(rel) = util::sanitize_rel_path(&file.path) else { continue };
+        let path = util::install_path(install_dir, &rel);
+        let Ok(meta) = std::fs::metadata(&path) else { continue };
+        total = total.saturating_add(meta.len().min(file.size));
+    }
+    total
+}
+
+/// Refuse a fresh install when the target volume cannot hold the finished game.
+///
+/// `free_bytes` is `None` when the volume is unknown (non-Windows host, unmapped drive): an unknown
+/// answer never blocks an install. Split from the caller so the boundary is testable without a
+/// full disk.
+fn check_fresh_install_space(
+    install_size: u64,
+    free_bytes: Option<u64>,
+    dir: &Path,
+) -> Result<()> {
+    if let Some(free) = free_bytes {
+        if install_size > free {
+            return Err(Error::Disk { needed: install_size, free, path: dir.to_path_buf() });
+        }
+    }
+    Ok(())
+}
+
 /// Rebuild the build record of an installed main game from its `.egstore` metadata.
 ///
 /// Only the CDN base URLs and the version string are consumed, so the main game does not have to be
@@ -1040,6 +1163,21 @@ fn install_components_inner(
                 .into(),
         ));
     }
+
+    // A fresh install preallocates every file up front, so refuse a volume that cannot hold the
+    // finished game before anything is created. Updates and resumes skip the check: their files are
+    // already provisioned, and the front end shows a more precise "bytes still needed" figure.
+    let fresh_install = !opts.install_dir.join(".egstore").exists()
+        && !has_partial_install(&opts.install_dir);
+    check_fresh_install_space(
+        manifest.install_size(),
+        if fresh_install {
+            crate::disk::volume_space(&opts.install_dir).ok().map(|space| space.free_bytes)
+        } else {
+            None
+        },
+        &opts.install_dir,
+    )?;
 
     // Validate every path before touching the disk.
     let mut files: Vec<(String, FileManifest)> = Vec::with_capacity(manifest.files.len());
@@ -2829,5 +2967,56 @@ mod tests {
         assert!(matches!(error, Error::Usage(_)));
         assert!(dir.exists());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn sizes_count_merged_files_and_bytes_already_on_disk() {
+        let dir = temp_dir("space-sizes");
+        let base = component(
+            "Base",
+            21,
+            vec![file("a.bin", 1, 1_000), file("b.bin", 2, 500)],
+            vec![chunk(1, 1_000, 1), chunk(2, 500, 2)],
+        );
+        let dlc = component(
+            "Dlc",
+            21,
+            vec![file("dlc/c.bin", 3, 200), file("a.bin", 1, 1_000)],
+            vec![chunk(1, 1_000, 1), chunk(3, 200, 3)],
+        );
+
+        let base_only = sizes_for(std::slice::from_ref(&base), &dir).unwrap();
+        assert_eq!(base_only.install_bytes, 1_500);
+        assert_eq!(base_only.needed_bytes, 1_500, "an empty directory needs the whole game");
+
+        let bundle = sizes_for(&[base.clone(), dlc.clone()], &dir).unwrap();
+        assert_eq!(bundle.install_bytes, 1_700, "a path shared with the add-on is counted once");
+        assert_eq!(bundle.needed_bytes, 1_700);
+
+        // A partially preallocated file only needs its missing tail, and a file that is already
+        // larger than the manifest says is capped at its planned size instead of freeing space.
+        std::fs::create_dir_all(dir.join("dlc")).unwrap();
+        std::fs::write(dir.join("a.bin"), vec![0u8; 400]).unwrap();
+        std::fs::write(dir.join("dlc").join("c.bin"), vec![0u8; 900]).unwrap();
+        let resumed = sizes_for(&[base, dlc], &dir).unwrap();
+        assert_eq!(resumed.install_bytes, 1_700);
+        assert_eq!(resumed.needed_bytes, 1_100, "400 + 200 of 1,700 bytes are already provisioned");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fresh_install_space_check_only_blocks_a_known_shortfall() {
+        let dir = PathBuf::from("D:\\Games\\Example");
+        assert!(check_fresh_install_space(100, Some(100), &dir).is_ok());
+        assert!(check_fresh_install_space(0, Some(0), &dir).is_ok(), "zero install size fits");
+        assert!(matches!(
+            check_fresh_install_space(101, Some(100), &dir),
+            Err(Error::Disk { needed: 101, free: 100, .. })
+        ));
+        assert!(
+            check_fresh_install_space(u64::MAX, None, &dir).is_ok(),
+            "an unknown volume must never block an install"
+        );
     }
 }

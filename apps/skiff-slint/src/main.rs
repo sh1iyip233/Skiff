@@ -16,6 +16,7 @@ use covers::CoverLoader;
 use skiff_core::api::{Api, GameEntry, StageHook};
 use skiff_core::auth;
 use skiff_core::config::Config;
+use skiff_core::disk;
 use skiff_core::download::{Phase, Progress};
 use skiff_core::http::Client;
 use skiff_core::install::{self, InstallOptions};
@@ -32,6 +33,16 @@ const AUTH_REDIRECT_URL: &str = "https://www.epicgames.com/id/api/redirect?clien
 
 /// How often state is copied into the UI. Also drives the indeterminate sweep.
 const TICK: Duration = Duration::from_millis(60);
+
+/// Upper bound on how long the drawer waits for a size estimate.
+///
+/// A game with many add-ons resolves one build + manifest per component; without a cap a stalled
+/// request would keep the install button disabled for the request timeout (two minutes). A timeout
+/// is reported as "unknown", which never blocks the download.
+const SPACE_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often the cached free-space reading is refreshed while the drawer is open.
+const SPACE_REFRESH_INTERVAL: Duration = Duration::from_millis(1_500);
 
 // ---------------------------------------------------------------------------------------------
 // small helpers
@@ -730,11 +741,55 @@ impl Snapshot {
     }
 }
 
+/// A resolved size estimate plus the volume reading taken next to it.
+struct ReadySpace {
+    preview: install::SpacePreview,
+    volume: Option<disk::VolumeSpace>,
+}
+
+/// Cached result of one game's pre-download estimate.
+enum SpaceEntry {
+    Ready(ReadySpace),
+    Failed(String),
+}
+
+/// Per-session estimates and the single probe / volume refresh allowed to run at a time.
+#[derive(Default)]
+struct SpaceCache {
+    /// Bumped whenever cached estimates stop being valid (library refresh, settings save, install
+    /// finished). A probe started under an older generation drops its result instead of publishing
+    /// a stale one.
+    generation: u64,
+    /// Probe currently running and the flag that cancels it.
+    probing: Option<(String, Arc<AtomicBool>)>,
+    /// A background free-space refresh is in flight.
+    volume_busy: bool,
+    /// Lower-cased app name -> estimate.
+    entries: HashMap<String, SpaceEntry>,
+}
+
+impl SpaceCache {
+    fn key(app: &str) -> String {
+        app.to_lowercase()
+    }
+
+    fn remove(&mut self, app: &str) {
+        self.generation = self.generation.wrapping_add(1);
+        self.entries.remove(&Self::key(app));
+    }
+
+    fn clear(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.entries.clear();
+    }
+}
+
 struct State {
     snapshot: Mutex<Snapshot>,
     library: Mutex<Library>,
     config: Mutex<Config>,
     covers: Arc<CoverLoader>,
+    space: Mutex<SpaceCache>,
     selected_app: Mutex<Option<String>>,
     /// Set after a successful login so the next "save"/"finish" fetches the new account's library.
     needs_refresh: AtomicBool,
@@ -753,6 +808,7 @@ impl State {
             library: Mutex::new(Library::default()),
             config: Mutex::new(config),
             covers,
+            space: Mutex::new(SpaceCache::default()),
             selected_app: Mutex::new(None),
             needs_refresh: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
@@ -844,6 +900,10 @@ fn start_refresh(state: Arc<State>) {
                     library.set_games(games, &install_root);
                     library.visible.len()
                 };
+                // Builds may have changed: every cached size estimate is stale now.
+                if let Ok(mut space) = worker_state.space.lock() {
+                    space.clear();
+                }
                 if let Ok(mut snapshot) = worker_state.snapshot.lock() {
                     snapshot.refresh_busy = false;
                     snapshot.refresh_progress = 1.0;
@@ -986,6 +1046,321 @@ fn push_selection(ui: &AppWindow, state: &State) {
         snapshot.selected_dlc_text = dlc_text;
         snapshot.can_resume = can_resume;
         snapshot.selected_install_status = install_status as i32;
+    });
+}
+
+// ---------------------------------------------------------------------------------------------
+// pre-download space estimate
+// ---------------------------------------------------------------------------------------------
+
+/// What the drawer shows before an install can start.
+struct SpaceView {
+    /// An estimate is being computed; the install button waits for it.
+    pending: bool,
+    /// An estimate exists (the volume reading may still be unknown).
+    known: bool,
+    /// The target volume can hold what the install still needs.
+    fits: bool,
+    required_text: String,
+    free_text: String,
+    detail_text: String,
+    note: String,
+    note_tone: i32,
+    install_enabled: bool,
+}
+
+impl SpaceView {
+    /// Nothing known and nothing being computed: no gate.
+    fn unknown() -> SpaceView {
+        SpaceView {
+            pending: false,
+            known: false,
+            fits: true,
+            required_text: "—".to_string(),
+            free_text: "—".to_string(),
+            detail_text: String::new(),
+            note: String::new(),
+            note_tone: 0,
+            install_enabled: true,
+        }
+    }
+}
+
+/// Render the space card for `app` from the cache and the current add-on choice.
+///
+/// Pure so the gate rules stay testable: an unreadable volume or a failed estimate never disables
+/// the button, while a known shortfall always does.
+fn space_view(cache: &SpaceCache, app: &str, include_dlc: bool) -> SpaceView {
+    if app.is_empty() {
+        return SpaceView::unknown();
+    }
+    let key = SpaceCache::key(app);
+    let pending = cache
+        .probing
+        .as_ref()
+        .map(|(running, _)| running == &key)
+        .unwrap_or(false);
+
+    let Some(entry) = cache.entries.get(&key) else {
+        if !pending {
+            return SpaceView::unknown();
+        }
+        return SpaceView {
+            pending: true,
+            known: false,
+            fits: true,
+            required_text: "…".to_string(),
+            free_text: "…".to_string(),
+            detail_text: String::new(),
+            note: "正在解析构建与清单以计算所需空间…".to_string(),
+            note_tone: 0,
+            install_enabled: false,
+        };
+    };
+
+    match entry {
+        SpaceEntry::Failed(reason) => SpaceView {
+            pending: false,
+            known: false,
+            fits: true,
+            required_text: "—".to_string(),
+            free_text: "—".to_string(),
+            detail_text: String::new(),
+            note: format!("无法获取所需空间（{reason}），仍可尝试安装。"),
+            note_tone: 2,
+            install_enabled: true,
+        },
+        SpaceEntry::Ready(ready) => {
+            let sizes = if include_dlc {
+                &ready.preview.with_dlc
+            } else {
+                &ready.preview.base_only
+            };
+            let needed = sizes.needed_bytes;
+            let required_text = if needed == 0 {
+                "无需额外空间".to_string()
+            } else {
+                human_bytes(needed)
+            };
+
+            let (free_text, fits, detail_text, mut note, mut tone) = match ready.volume {
+                Some(volume) => {
+                    let detail = format!(
+                        "安装后占用 {} · 目标盘共 {}",
+                        human_bytes(sizes.install_bytes),
+                        human_bytes(volume.total_bytes)
+                    );
+                    if volume.free_bytes < needed {
+                        (
+                            human_bytes(volume.free_bytes),
+                            false,
+                            detail,
+                            format!(
+                                "剩余空间不足，还差 {}。请清理磁盘或更换安装目录。",
+                                human_bytes(needed.saturating_sub(volume.free_bytes))
+                            ),
+                            3,
+                        )
+                    } else if needed == 0 {
+                        (
+                            human_bytes(volume.free_bytes),
+                            true,
+                            detail,
+                            "现有文件已覆盖安装所需空间，无需额外空间。".to_string(),
+                            1,
+                        )
+                    } else {
+                        (
+                            human_bytes(volume.free_bytes),
+                            true,
+                            detail,
+                            "空间充足，可以开始下载。".to_string(),
+                            1,
+                        )
+                    }
+                }
+                None => (
+                    "—".to_string(),
+                    true,
+                    format!("安装后占用 {}", human_bytes(sizes.install_bytes)),
+                    "尚未读取到目标盘剩余空间，暂不做空间检查。".to_string(),
+                    0,
+                ),
+            };
+
+            if !ready.preview.skipped_dlc.is_empty() {
+                note = format!(
+                    "{note} {} 个附加内容无法解析，未计入预估。",
+                    ready.preview.skipped_dlc.len()
+                );
+                tone = tone.max(2);
+            }
+
+            SpaceView {
+                pending: false,
+                known: true,
+                fits,
+                required_text,
+                free_text,
+                detail_text,
+                note,
+                note_tone: tone,
+                install_enabled: fits,
+            }
+        }
+    }
+}
+
+/// Compute `app`'s size estimate in the background.
+///
+/// Only the open drawer asks for this, and only one probe runs at a time: selecting another game
+/// cancels the running one so the newest selection is not stuck behind a slow manifest fetch.
+fn ensure_space_probe(state: &Arc<State>, app: &str, target_dir: &str) {
+    if app.is_empty() || target_dir.trim().is_empty() {
+        return;
+    }
+    let key = SpaceCache::key(app);
+
+    // Cheap precheck on every tick: a cached estimate or a probe for this game needs no work, and a
+    // probe for another game is cancelled so this selection wins as soon as it exits.
+    {
+        let Ok(cache) = state.space.lock() else { return };
+        if cache.entries.contains_key(&key) {
+            return;
+        }
+        match &cache.probing {
+            Some((running, _)) if running == &key => return,
+            Some((_, running_cancel)) => {
+                running_cancel.store(true, Ordering::Relaxed);
+                return;
+            }
+            None => {}
+        }
+    }
+
+    // Read what the worker needs before registering: no lock is held across these clones.
+    let Some(group) = state
+        .library
+        .lock()
+        .ok()
+        .and_then(|library| library.group_any(app))
+    else {
+        return;
+    };
+    let cfg = state.config.lock().map(|cfg| cfg.clone()).unwrap_or_default();
+    let dir = PathBuf::from(target_dir);
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let generation = {
+        let Ok(mut cache) = state.space.lock() else { return };
+        // Re-check after the clones: another tick may have registered a probe or published a result.
+        if cache.entries.contains_key(&key) {
+            return;
+        }
+        match &cache.probing {
+            Some((running, _)) if running == &key => return,
+            Some((_, running_cancel)) => {
+                running_cancel.store(true, Ordering::Relaxed);
+                return;
+            }
+            None => {}
+        }
+        cache.probing = Some((key.clone(), cancel.clone()));
+        cache.generation
+    };
+
+    let worker_state = state.clone();
+    std::thread::spawn(move || {
+        let timed_out = Arc::new(AtomicBool::new(false));
+        {
+            let cancel = cancel.clone();
+            let timed_out = timed_out.clone();
+            // Detached watchdog: it only raises the flags, and the probe thread is never joined.
+            std::thread::spawn(move || {
+                std::thread::sleep(SPACE_PROBE_TIMEOUT);
+                timed_out.store(true, Ordering::Relaxed);
+                cancel.store(true, Ordering::Relaxed);
+            });
+        }
+
+        let result = (|| -> skiff_core::Result<install::SpacePreview> {
+            let client = Client::new();
+            let tokens = auth::load_tokens()?
+                .ok_or_else(|| skiff_core::Error::Auth("not logged in".into()))?;
+            let tokens = auth::ensure_fresh(&cfg, &client, tokens)?;
+            let api = Api::new(&client, &cfg, &tokens.access_token).with_cancel(cancel.clone());
+            install::preview_install_sizes(&api, &group.game, &group.dlc, &dir)
+        })();
+
+        let cancelled = cancel.load(Ordering::Relaxed);
+        let timed_out = timed_out.load(Ordering::Relaxed);
+        if let Ok(mut cache) = worker_state.space.lock() {
+            if cache
+                .probing
+                .as_ref()
+                .map(|(running, _)| running == &key)
+                .unwrap_or(false)
+            {
+                cache.probing = None;
+            }
+            if cache.generation == generation {
+                let entry = match result {
+                    Ok(preview) => Some(SpaceEntry::Ready(ReadySpace { preview, volume: None })),
+                    Err(_) if cancelled && timed_out => {
+                        Some(SpaceEntry::Failed("计算超时（网络较慢）".to_string()))
+                    }
+                    // Cancelled because another game was selected: caching the failure would leave
+                    // a stale error behind when the user comes back.
+                    Err(_) if cancelled => None,
+                    Err(e) => Some(SpaceEntry::Failed(e.to_string())),
+                };
+                if let Some(entry) = entry {
+                    cache.entries.insert(key.clone(), entry);
+                }
+            }
+        }
+
+        // The volume query can block for a long time on a disconnected share, so it runs after the
+        // estimate is published: the drawer is never stuck waiting for it.
+        if let Some(volume) = disk::volume_space(&dir).ok() {
+            if let Ok(mut cache) = worker_state.space.lock() {
+                if cache.generation == generation {
+                    if let Some(SpaceEntry::Ready(ready)) = cache.entries.get_mut(&key) {
+                        ready.volume = Some(volume);
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Re-read the target volume in the background while the drawer stays open.
+fn refresh_space_volume(state: &Arc<State>, app: &str) {
+    let key = SpaceCache::key(app);
+    let (dir, generation) = {
+        let Ok(mut cache) = state.space.lock() else { return };
+        if cache.volume_busy {
+            return;
+        }
+        let Some(SpaceEntry::Ready(ready)) = cache.entries.get(&key) else {
+            return;
+        };
+        let dir = ready.preview.target_dir.clone();
+        cache.volume_busy = true;
+        (dir, cache.generation)
+    };
+
+    let worker_state = state.clone();
+    std::thread::spawn(move || {
+        let volume = disk::volume_space(&dir).ok();
+        if let Ok(mut cache) = worker_state.space.lock() {
+            cache.volume_busy = false;
+            if cache.generation == generation {
+                if let Some(SpaceEntry::Ready(ready)) = cache.entries.get_mut(&key) {
+                    ready.volume = volume;
+                }
+            }
+        }
     });
 }
 
@@ -1354,6 +1729,10 @@ fn begin_install(
         if let Ok(mut library) = worker_state.library.lock() {
             library.rescan_local(&install_root);
         }
+        // The install changed what is on disk and how much room is left.
+        if let Ok(mut space) = worker_state.space.lock() {
+            space.remove(&game.app_name);
+        }
     });
     Ok(())
 }
@@ -1389,6 +1768,10 @@ fn apply_settings(ui: &AppWindow, state: &State) -> Result<Config, String> {
 
     if let Ok(mut cached) = state.config.lock() {
         *cached = cfg.clone();
+    }
+    // The install root may have moved, so the size estimates were computed for another volume.
+    if let Ok(mut space) = state.space.lock() {
+        space.clear();
     }
     if let Ok(mut library) = state.library.lock() {
         library.rescan_local(Path::new(&cfg.install_root));
@@ -1951,6 +2334,19 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
+    // ---- retry the space estimate --------------------------------------------------------
+    {
+        let state = state.clone();
+        ui.on_retry_space(move || {
+            let app = state.selected_app.lock().ok().and_then(|slot| slot.clone());
+            if let Some(app) = app {
+                if let Ok(mut space) = state.space.lock() {
+                    space.remove(&app);
+                }
+            }
+        });
+    }
+
     // ---- mirror state into the UI --------------------------------------------------------
     let timer = slint::Timer::default();
     {
@@ -1963,6 +2359,9 @@ fn main() -> Result<(), slint::PlatformError> {
         let mut last_cover_rebuild = Instant::now() - Duration::from_secs(1);
         let mut shown_job_cover_target = String::new();
         let mut shown_job_cover_loaded = false;
+        // Free space changes while the window is open; keep the gate fresh without blocking the UI
+        // thread on a possibly disconnected volume.
+        let mut last_space_refresh = Instant::now() - SPACE_REFRESH_INTERVAL;
 
         timer.start(slint::TimerMode::Repeated, TICK, move || {
             let Some(ui) = ui_weak.upgrade() else { return };
@@ -2135,6 +2534,31 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_uninstall_open(snapshot.uninstall_open);
             ui.set_uninstall_busy(snapshot.uninstall_busy);
             ui.set_uninstall_error(SharedString::from(snapshot.uninstall_error.clone()));
+
+            // ---- pre-download space gate ----
+            // Only the open drawer pays for the estimate; the volume reading is refreshed in the
+            // background so a slow or disconnected drive never blocks this tick.
+            let include_dlc = ui.get_include_dlc();
+            if ui.get_detail_open() && !snapshot.selected_app.is_empty() {
+                ensure_space_probe(&state, &snapshot.selected_app, &snapshot.target_dir);
+                if last_space_refresh.elapsed() >= SPACE_REFRESH_INTERVAL {
+                    refresh_space_volume(&state, &snapshot.selected_app);
+                    last_space_refresh = Instant::now();
+                }
+            }
+            let space = {
+                let cache = state.space.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                space_view(&cache, &snapshot.selected_app, include_dlc)
+            };
+            ui.set_space_pending(space.pending);
+            ui.set_space_known(space.known);
+            ui.set_space_fits(space.fits);
+            ui.set_install_enabled(space.install_enabled);
+            ui.set_space_required_text(SharedString::from(space.required_text));
+            ui.set_space_free_text(SharedString::from(space.free_text));
+            ui.set_space_detail_text(SharedString::from(space.detail_text));
+            ui.set_space_note(SharedString::from(space.note));
+            ui.set_space_note_tone(space.note_tone);
 
             ui.set_refresh_busy(snapshot.refresh_busy);
             ui.set_refresh_progress(snapshot.refresh_progress);
@@ -2586,5 +3010,113 @@ mod tests {
 
         assert_eq!(tone, 1);
         assert!(text.contains("已清理《Brotato》的未完成安装"));
+    }
+
+    // ---- pre-download space gate ---------------------------------------------------------
+
+    fn sizes(install: u64, needed: u64) -> install::InstallSizes {
+        install::InstallSizes { install_bytes: install, needed_bytes: needed }
+    }
+
+    fn ready(needed: u64, free: Option<u64>) -> SpaceEntry {
+        SpaceEntry::Ready(ReadySpace {
+            preview: install::SpacePreview {
+                target_dir: PathBuf::from("D:\\Games\\Test"),
+                base_only: sizes(needed + 10, needed),
+                with_dlc: sizes(needed + 100, needed + 90),
+                skipped_dlc: Vec::new(),
+            },
+            volume: free.map(|free_bytes| disk::VolumeSpace {
+                free_bytes,
+                total_bytes: 1_000,
+            }),
+        })
+    }
+
+    fn cache_with(entry: SpaceEntry) -> SpaceCache {
+        let mut cache = SpaceCache::default();
+        cache.entries.insert("game".to_string(), entry);
+        cache
+    }
+
+    #[test]
+    fn space_gate_enables_the_button_when_the_volume_fits() {
+        let view = space_view(&cache_with(ready(100, Some(400))), "Game", false);
+        assert!(view.known);
+        assert!(view.fits);
+        assert!(view.install_enabled);
+        assert_eq!(view.required_text, human_bytes(100));
+        assert_eq!(view.free_text, human_bytes(400));
+        assert_eq!(view.note_tone, 1);
+        assert!(view.note.contains("空间充足"), "{}", view.note);
+    }
+
+    #[test]
+    fn space_gate_blocks_the_button_when_the_volume_is_short() {
+        let view = space_view(&cache_with(ready(100, Some(40))), "Game", false);
+        assert!(view.known);
+        assert!(!view.fits);
+        assert!(!view.install_enabled, "a known shortfall must disable the download button");
+        assert_eq!(view.note_tone, 3);
+        assert!(view.note.contains("还差"), "{}", view.note);
+        assert!(view.note.contains(&human_bytes(60)), "{}", view.note);
+    }
+
+    #[test]
+    fn space_gate_uses_the_add_on_total_when_dlc_are_included() {
+        let cache = cache_with(ready(100, Some(150)));
+        let base = space_view(&cache, "Game", false);
+        let bundle = space_view(&cache, "Game", true);
+        assert_eq!(base.required_text, human_bytes(100));
+        assert_eq!(bundle.required_text, human_bytes(190));
+        // 190 > 150: only the bundle exceeds the volume.
+        assert!(base.install_enabled);
+        assert!(!bundle.install_enabled);
+    }
+
+    #[test]
+    fn space_gate_waits_while_the_estimate_runs() {
+        let mut cache = SpaceCache::default();
+        cache.probing = Some(("game".to_string(), Arc::new(AtomicBool::new(false))));
+        let view = space_view(&cache, "Game", false);
+        assert!(view.pending);
+        assert!(!view.known);
+        assert!(!view.install_enabled, "the button waits for the estimate");
+        assert!(view.note.contains("正在解析"), "{}", view.note);
+    }
+
+    #[test]
+    fn space_gate_stays_usable_when_the_estimate_failed() {
+        let view = space_view(&cache_with(SpaceEntry::Failed("network down".into())), "Game", false);
+        assert!(!view.known);
+        assert!(view.install_enabled, "an unknown estimate must not block the download");
+        assert_eq!(view.note_tone, 2);
+        assert!(view.note.contains("network down"), "{}", view.note);
+    }
+
+    #[test]
+    fn space_gate_reports_an_unreadable_volume_without_blocking() {
+        let view = space_view(&cache_with(ready(100, None)), "Game", false);
+        assert!(view.known);
+        assert!(view.install_enabled, "a failed volume query is unknown, not a shortfall");
+        assert_eq!(view.free_text, "—");
+        assert!(view.note.contains("暂不做空间检查"), "{}", view.note);
+    }
+
+    #[test]
+    fn space_gate_treats_a_provisioned_install_as_free() {
+        let view = space_view(&cache_with(ready(0, Some(0))), "Game", false);
+        assert!(view.known);
+        assert!(view.install_enabled);
+        assert_eq!(view.required_text, "无需额外空间");
+        assert!(view.note.contains("无需额外空间"), "{}", view.note);
+    }
+
+    #[test]
+    fn space_gate_is_open_when_nothing_is_selected() {
+        let view = space_view(&SpaceCache::default(), "", false);
+        assert!(!view.pending);
+        assert!(view.install_enabled);
+        assert_eq!(view.required_text, "—");
     }
 }
