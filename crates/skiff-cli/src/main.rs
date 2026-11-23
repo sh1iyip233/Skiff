@@ -32,6 +32,10 @@ USAGE:
                          [--limit-rate <50M>] [--dir <path>] [--platform <p>]
                          [--label <l>] [--no-dlc] [--verify] [--repair]
                          [--register-launcher] [-y]
+  skiff dlc list <appName> [--dir <path>] [--json]
+  skiff dlc add <appName> [<dlcName>...] [-j <n>] [--write-threads <n>] [--per-host <n>]
+                          [--limit-rate <50M>] [--dir <path>] [--register-launcher]
+                          [--dry-run] [-y]
   skiff verify <installDir> [--repair]
   skiff uninstall <installDir> [--keep-files]
   skiff config get | set <key> <value> | list
@@ -87,7 +91,7 @@ impl Args {
                     rest,
                     "json" | "no-progress" | "verify" | "repair" | "register-launcher" | "keep-files"
                         | "device-code" | "yes" | "verbose" | "auto-concurrency" | "open"
-                        | "refresh" | "all" | "no-dlc"
+                        | "refresh" | "all" | "no-dlc" | "dir-is-exact" | "dry-run"
                 ) || rest == "y"
                 {
                     args.switches.insert(rest.to_string());
@@ -160,6 +164,7 @@ fn run() -> Result<()> {
         Some("library") => cmd_library(&args, &cfg, json),
         Some("info") => cmd_info(&args, &cfg, json),
         Some("install") => cmd_install(&args, &cfg, json),
+        Some("dlc") => cmd_dlc(&args, &cfg, json),
         Some("verify") => cmd_verify(&args, &cfg),
         Some("uninstall") => cmd_uninstall(&args, &cfg),
         Some("config") => cmd_config(&args, &cfg),
@@ -639,6 +644,432 @@ fn cmd_install(args: &Args, cfg: &Config, json: bool) -> Result<()> {
     } else if let Some(error) = &outcome.launcher_error {
         println!("  launcher    : not registered ({error})");
         println!("  提示        : 游戏文件本身已装好，只是官方启动器不会显示为已安装。");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// dlc
+// ---------------------------------------------------------------------------------------------
+
+fn cmd_dlc(args: &Args, cfg: &Config, json: bool) -> Result<()> {
+    match args.positional_at(1) {
+        Some("list") => cmd_dlc_list(args, cfg, json),
+        Some("add") => cmd_dlc_add(args, cfg, json),
+        Some(other) => Err(Error::usage(format!("unknown dlc command '{other}'"))),
+        None => Err(Error::usage("dlc needs a subcommand: list | add")),
+    }
+}
+
+/// Where a game lives: `--dir`, else the existing install under the configured root, else the
+/// folder name the game would get on a fresh install.
+///
+/// `--dir` accepts either the install directory itself or a parent that contains it; an add-on can
+/// only be added to an existing install, so an exact match wins over folder-name construction.
+fn resolve_install_dir(args: &Args, cfg: &Config, game: &GameEntry) -> PathBuf {
+    if let Some(dir) = args.flag("dir") {
+        let path = PathBuf::from(dir);
+        if args.has("dir-is-exact") {
+            return path;
+        }
+        let is_this_install = install::load_installed_components(&path)
+            .map(|components| {
+                components
+                    .iter()
+                    .any(|component| component.app_name.eq_ignore_ascii_case(&game.app_name))
+            })
+            .unwrap_or(false);
+        if is_this_install {
+            return path;
+        }
+        if let Some(found) = install::find_existing_install(&path, &game.app_name) {
+            return found;
+        }
+        return install::default_install_dir(&path, game);
+    }
+    let root = PathBuf::from(&cfg.install_root);
+    install::find_existing_install(&root, &game.app_name)
+        .unwrap_or_else(|| install::default_install_dir(&root, game))
+}
+
+fn cmd_dlc_list(args: &Args, cfg: &Config, json: bool) -> Result<()> {
+    let app = args.required(2, "app name")?;
+    let client = client();
+    let tokens = require_tokens(cfg, &client)?;
+    let api = api(&client, cfg, &tokens);
+    let games = load_games(&api, &tokens)?;
+    let choice = select_bundle(&games, app)?;
+    if choice.orphan || choice.base.is_dlc {
+        return Err(Error::usage(format!(
+            "'{}' has no main game in this library; its add-ons cannot be installed alone",
+            choice.selected.title
+        )));
+    }
+    let dir = resolve_install_dir(args, cfg, &choice.base);
+    let installed_components = install::load_installed_components(&dir).unwrap_or_default();
+    let installed: HashSet<String> = installed_components
+        .iter()
+        .map(|component| component.app_name.to_lowercase())
+        .collect();
+    let missing = choice
+        .dlc
+        .iter()
+        .filter(|dlc| !installed.contains(&dlc.app_name.to_lowercase()))
+        .count();
+
+    if json {
+        let rows: Vec<serde_json::Value> = choice
+            .dlc
+            .iter()
+            .map(|dlc| {
+                serde_json::json!({
+                    "app_name": dlc.app_name,
+                    "title": dlc.title,
+                    "installed": installed.contains(&dlc.app_name.to_lowercase()),
+                })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "base_app_name": choice.base.app_name,
+                "base_title": choice.base.title,
+                "install_dir": dir.to_string_lossy(),
+                "installed": !installed_components.is_empty(),
+                "missing": missing,
+                "dlc": rows,
+            })
+        );
+        return Ok(());
+    }
+
+    println!("{} ({})", choice.base.title, choice.base.app_name);
+    println!("install dir : {}", dir.display());
+    println!(
+        "installed   : {}",
+        if installed_components.is_empty() {
+            "no (main game not found)".to_string()
+        } else {
+            format!("yes ({} component(s))", installed_components.len())
+        }
+    );
+    if choice.dlc.is_empty() {
+        println!("add-ons     : none owned for this game");
+        return Ok(());
+    }
+    println!();
+    println!("{:<46} {:<34} STATE", "TITLE", "APP NAME");
+    for dlc in &choice.dlc {
+        let state = if installed.contains(&dlc.app_name.to_lowercase()) { "installed" } else { "missing" };
+        println!(
+            "{:<46} {:<34} {}",
+            truncate(&dlc.title, 46),
+            truncate(&dlc.app_name, 34),
+            state
+        );
+    }
+    println!();
+    println!("{} add-on(s) · {} missing", choice.dlc.len(), missing);
+    if missing > 0 {
+        println!("install them with: skiff dlc add {app}");
+    }
+    Ok(())
+}
+
+fn cmd_dlc_add(args: &Args, cfg: &Config, json: bool) -> Result<()> {
+    let app = args.required(2, "app name")?;
+    let concurrency = concurrency_from(args, cfg)?;
+    let client = client();
+    let tokens = require_tokens(cfg, &client)?;
+    let api = api(&client, cfg, &tokens);
+    let games = load_games(&api, &tokens)?;
+    let choice = select_bundle(&games, app)?;
+    if choice.orphan || choice.base.is_dlc {
+        return Err(Error::usage(format!(
+            "'{}' has no main game in this library; install the main game first",
+            choice.selected.title
+        )));
+    }
+    let base = choice.base.clone();
+    let install_dir = resolve_install_dir(args, cfg, &base);
+    let installed: HashSet<String> = install::load_installed_components(&install_dir)
+        .map_err(|_| {
+            Error::usage(format!(
+                "{} is not installed in {}; run `skiff install {}` first",
+                base.title,
+                install_dir.display(),
+                base.app_name
+            ))
+        })?
+        .into_iter()
+        .map(|component| component.app_name.to_lowercase())
+        .collect();
+
+    // Explicit selectors win; with none, every owned add-on that is not installed yet is added.
+    // positional = ["dlc", "add", <appName>, <dlcName>...].
+    let selectors: Vec<&str> = args.positional.iter().skip(3).map(String::as_str).collect();
+    let mut picked: Vec<GameEntry> = Vec::new();
+    if selectors.is_empty() {
+        for dlc in &choice.dlc {
+            if !installed.contains(&dlc.app_name.to_lowercase()) {
+                picked.push(dlc.clone());
+            }
+        }
+    } else {
+        for selector in selectors {
+            // Exact title or app name first; otherwise accept a unique substring so that
+            // "Phantom Liberty" selects "Cyberpunk 2077: Phantom Liberty".
+            let needle = selector.trim().to_lowercase();
+            let chosen = match choice.dlc.iter().find(|dlc| {
+                dlc.app_name.eq_ignore_ascii_case(selector)
+                    || dlc.title.eq_ignore_ascii_case(selector)
+            }) {
+                Some(dlc) => dlc,
+                None => {
+                    let partial: Vec<&GameEntry> = choice
+                        .dlc
+                        .iter()
+                        .filter(|dlc| {
+                            !needle.is_empty()
+                                && (dlc.title.to_lowercase().contains(&needle)
+                                    || dlc.app_name.to_lowercase().contains(&needle))
+                        })
+                        .collect();
+                    match partial.len() {
+                        1 => partial[0],
+                        0 => {
+                            return Err(Error::usage(format!(
+                                "'{selector}' is not an add-on of {}; see `skiff dlc list {app}`",
+                                base.title
+                            )))
+                        }
+                        _ => {
+                            return Err(Error::usage(format!(
+                                "'{selector}' matches {} add-ons of {} ({}); use a full title or app name",
+                                partial.len(),
+                                base.title,
+                                partial
+                                    .iter()
+                                    .map(|dlc| dlc.title.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )))
+                        }
+                    }
+                }
+            };
+            if !picked
+                .iter()
+                .any(|existing| existing.app_name.eq_ignore_ascii_case(&chosen.app_name))
+            {
+                picked.push(chosen.clone());
+            }
+        }
+    }
+
+    // Add-ons already in the directory need no work; say so instead of silently doing nothing.
+    let already: Vec<String> = picked
+        .iter()
+        .filter(|dlc| installed.contains(&dlc.app_name.to_lowercase()))
+        .map(|dlc| dlc.title.clone())
+        .collect();
+    picked.retain(|dlc| !installed.contains(&dlc.app_name.to_lowercase()));
+
+    if picked.is_empty() {
+        if !already.is_empty() {
+            if !json {
+                println!("already installed: {}", already.join(", "));
+            }
+            return Ok(());
+        }
+        return Err(Error::usage(format!(
+            "no add-on of {} is left to install; see `skiff dlc list {app}`",
+            base.title
+        )));
+    }
+
+    let limit = match args.flag("limit-rate").or(cfg.limit_rate.as_deref()) {
+        Some(text) => util::parse_rate(text)?,
+        None => None,
+    };
+
+    // Resolving each add-on is exactly what `add_dlc` will do next, so a dry run proves the whole
+    // plan without writing a byte (an add-on can be tens of gigabytes).
+    if args.has("dry-run") {
+        println!("dry run: nothing will be written");
+        println!("location    : {}", install_dir.display());
+        // Files already present in the main game, by their manifest path.
+        let installed_hashes: HashMap<String, [u8; 20]> =
+            install::load_installed_files(&install_dir)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(path, meta)| (path, meta.hash))
+                .collect();
+        // Printed so "no overlap" can be told apart from "nothing was compared".
+        println!("main game   : {} file(s) recorded on disk", installed_hashes.len());
+        for dlc in &picked {
+            match api.build(dlc) {
+                Ok(build) => {
+                    let parsed = api
+                        .manifest(&build.manifest_uri)
+                        .and_then(|raw| Manifest::parse(&raw));
+                    println!("  + {} ({})", dlc.title, dlc.app_name);
+                    println!("    build    : {}", build.build_version);
+                    match parsed {
+                        Ok(manifest) => {
+                            let bytes: u64 = manifest.files.iter().map(|file| file.size).sum();
+                            println!(
+                                "    contents : {} chunk(s), {} file(s), {}",
+                                manifest.chunks.len(),
+                                manifest.files.len(),
+                                util::human_bytes(bytes)
+                            );
+                            // Same path but different content means the add-on expects a newer
+                            // main game than the one on disk; the merge keeps the main game copy.
+                            let overlap = manifest
+                                .files
+                                .iter()
+                                .filter(|file| {
+                                    installed_hashes
+                                        .get(&file.path)
+                                        .map(|hash| hash != &file.hash)
+                                        .unwrap_or(false)
+                                })
+                                .count();
+                            if overlap > 0 {
+                                println!(
+                                    "    overlap  : {overlap} file(s) already exist in the main game with different content"
+                                );
+                                println!(
+                                    "               本体可能落后于这个 DLC；建议先 `skiff install {}` 把本体更新到同一构建",
+                                    base.app_name
+                                );
+                            }
+                        }
+                        Err(e) => println!("    contents : manifest unavailable ({e})"),
+                    }
+                }
+                Err(e) => println!("  ! {} ({}) cannot be resolved: {e}", dlc.title, dlc.app_name),
+            }
+        }
+        for title in &already {
+            println!("  = {title} (already installed)");
+        }
+        return Ok(());
+    }
+
+    if !json {
+        println!("adding add-on(s) to {}", base.title);
+        println!("location    : {}", install_dir.display());
+        for dlc in &picked {
+            println!("  + {} ({})", dlc.title, dlc.app_name);
+        }
+        for title in &already {
+            println!("  = {title} (already installed)");
+        }
+        println!(
+            "concurrency: {} downloads, {} writers, verify {}, per-host {}",
+            concurrency.downloads,
+            concurrency.writers,
+            concurrency.verify_threads(),
+            concurrency
+                .per_host
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unlimited".to_string())
+        );
+        println!("note        : the main game is not re-downloaded or re-verified");
+    }
+
+    let interactive = !json && !args.has("no-progress") && std::io::stdout().is_terminal();
+    let ui = Arc::new(std::sync::Mutex::new(ProgressUi::new(interactive)));
+    let callback = {
+        let ui = ui.clone();
+        Arc::new(move |progress: Progress| {
+            if let Ok(mut ui) = ui.lock() {
+                ui.render(&progress);
+            }
+        }) as Arc<dyn Fn(Progress) + Send + Sync>
+    };
+
+    let options = InstallOptions {
+        install_dir: install_dir.clone(),
+        concurrency: concurrency.clone(),
+        limit_bytes_per_sec: limit,
+        verify: true,
+        repair: args.has("repair"),
+        register_launcher: args.has("register-launcher") || cfg.register_launcher,
+    };
+
+    let started = Instant::now();
+    let outcome = install::add_dlc(&client, &api, &base, &picked, &options, Some(callback))?;
+    if interactive {
+        let mut ui = ui.lock().unwrap();
+        ui.finish();
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "app_name": outcome.app_name,
+                "install_dir": install_dir.to_string_lossy(),
+                "added": outcome.dlc_apps,
+                "skipped": outcome.skipped_dlc,
+                "conflicts": outcome.conflicts,
+                "files": outcome.files,
+                "chunks_downloaded": outcome.chunks_downloaded,
+                "repaired_chunks": outcome.repaired_chunks,
+                "peak_inflight": outcome.peak_inflight,
+                "elapsed_secs": outcome.elapsed_secs,
+                "launcher_registered": outcome.launcher_registered,
+                "launcher_running": outcome.launcher_running,
+                "launcher_error": outcome.launcher_error,
+            })
+        );
+        return Ok(());
+    }
+
+    println!();
+    println!("added to {}", base.title);
+    println!("  location    : {}", install_dir.display());
+    println!("  components  : {}", outcome.components);
+    if !outcome.dlc_apps.is_empty() {
+        println!("  added       : {}", outcome.dlc_apps.join(", "));
+    }
+    if !outcome.skipped_dlc.is_empty() {
+        println!("  skipped     : {}", outcome.skipped_dlc.join(", "));
+    }
+    println!("  files       : {} ({} in this install)", outcome.files, install_dir.join(".egstore").display());
+    println!("  downloaded  : {} chunks", outcome.chunks_downloaded);
+    if outcome.repaired_chunks > 0 {
+        println!("  repaired    : {} chunks", outcome.repaired_chunks);
+    }
+    if outcome.conflicts > 0 {
+        println!(
+            "  conflicts   : {} file(s) kept the main game version",
+            outcome.conflicts
+        );
+        println!(
+            "  提示        : 有 {} 个文件和本体重叠但内容不同，通常意味着本体版本落后于这个 DLC；\
+建议先 `skiff install {}` 把本体更新到同一构建，否则 DLC 可能缺文件。",
+            outcome.conflicts, base.app_name
+        );
+    }
+    println!(
+        "  peak inflight: {} (configured {})",
+        outcome.peak_inflight, concurrency.downloads
+    );
+    println!("  elapsed     : {:.1}s", started.elapsed().as_secs_f64());
+    if outcome.launcher_registered {
+        println!("  launcher    : registered with Epic Games Launcher");
+        if outcome.launcher_running {
+            println!(
+                "  提示        : Epic 启动器正在运行。它只在启动时读取安装清单，\
+请从托盘菜单完全退出（关闭窗口不算）后重新打开，DLC 才会被识别。"
+            );
+        }
+    } else if let Some(error) = &outcome.launcher_error {
+        println!("  launcher    : not registered ({error})");
     }
     Ok(())
 }

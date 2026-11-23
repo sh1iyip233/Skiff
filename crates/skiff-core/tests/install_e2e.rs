@@ -869,3 +869,197 @@ fn bundle_installs_base_and_dlc_into_one_directory() {
     assert!(!egstore.exists(), "metadata must be removed");
 }
 
+// ---------------------------------------------------------------------------------------------
+// adding an add-on to a finished install
+// ---------------------------------------------------------------------------------------------
+
+/// An add-on build: one chunk shared with the main game plus one chunk only it ships.
+///
+/// Returned as (manifest, raw manifest, extra CDN objects, expected file bytes) so the caller can
+/// register the objects with the mock CDN before it starts (the CDN base URL comes from its port).
+fn addon_fixtures(
+    base_manifest: &Manifest,
+    payloads: &[Vec<u8>],
+) -> (Manifest, Vec<u8>, Vec<(String, Vec<u8>)>, Vec<u8>) {
+    let shared_chunk = base_manifest.chunks[0].clone();
+    let extra_data = payload(6);
+    let extra_guid = [7u32, 0x1000, 0x2000, 0x3000];
+    let extra_bytes = container(&extra_data, extra_guid);
+    let extra_path = chunk_path(18, 6, chunk::rolling_hash(&extra_data), &extra_guid, None);
+    let extra_chunk = ChunkInfo {
+        guid: extra_guid,
+        rolling_hash: chunk::rolling_hash(&extra_data),
+        sha1: sha1(&extra_data),
+        group_num: 6,
+        window_size: extra_data.len() as u32,
+        file_size: extra_bytes.len() as i64,
+        secret_guid: None,
+        encryption_tag: None,
+    };
+
+    let mut content = payloads[0].clone();
+    content.extend_from_slice(&extra_data);
+    let file = FileManifest {
+        path: "dlc/c.bin".to_string(),
+        symlink_target: String::new(),
+        hash: sha1(&content),
+        flags: 0,
+        install_tags: Vec::new(),
+        parts: vec![
+            ChunkPart {
+                guid: shared_chunk.guid,
+                chunk_offset: 0,
+                size: CHUNK_SIZE as u32,
+                file_offset: 0,
+            },
+            ChunkPart {
+                guid: extra_guid,
+                chunk_offset: 0,
+                size: CHUNK_SIZE as u32,
+                file_offset: CHUNK_SIZE as u64,
+            },
+        ],
+        size: content.len() as u64,
+        md5: None,
+        mime_type: String::new(),
+        sha256: None,
+    };
+
+    let mut manifest = Manifest {
+        version: 18,
+        compressed: true,
+        encrypted: false,
+        header_sha1: [0; 20],
+        meta: ManifestMeta {
+            feature_level: 18,
+            app_name: "E2EDlc".to_string(),
+            build_version: "++E2EDlc+1-Windows".to_string(),
+            ..Default::default()
+        },
+        chunks: vec![shared_chunk, extra_chunk],
+        files: vec![file],
+        custom: BTreeMap::new(),
+        raw: Vec::new(),
+    };
+    let raw = manifest.write_binary().unwrap();
+    manifest.raw = raw.clone();
+    (manifest, raw, vec![(format!("/{extra_path}"), extra_bytes)], content)
+}
+
+fn addon_build(cdn_base: &str) -> BuildInfo {
+    BuildInfo {
+        app_name: "E2EDlc".to_string(),
+        namespace: "e2e".to_string(),
+        catalog_item_id: "dlc-cid".to_string(),
+        label_name: "Live-Windows".to_string(),
+        build_version: "++E2EDlc+1-Windows".to_string(),
+        manifest_uri: format!("{cdn_base}/dlc.manifest"),
+        manifest_hash: "unused".to_string(),
+        base_urls: vec![cdn_base.to_string()],
+    }
+}
+
+/// The `.item` the launcher would read for `app`.
+fn item_for(dir: &Path, app: &str) -> serde_json::Value {
+    std::fs::read_dir(dir.join(".egstore"))
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().extension().map(|ext| ext == "item").unwrap_or(false))
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .filter_map(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .find(|item| item["AppName"] == app)
+        .unwrap_or_else(|| panic!("no .item for {app}"))
+}
+
+#[test]
+fn adds_an_add_on_without_touching_the_finished_install() {
+    let (base_manifest, base_raw, mut containers, payloads) = fixtures();
+    let parsed = Manifest::parse(&base_raw).unwrap();
+    let (addon_manifest, addon_raw, addon_objects, addon_content) =
+        addon_fixtures(&base_manifest, &payloads);
+    for (path, bytes) in addon_objects {
+        containers.insert(path, bytes);
+    }
+    let cdn = MockCdn::start(containers);
+    let dir = temp_dir("addon-add");
+    let opts = options(&dir, 4);
+
+    // 1. A finished main-game install, exactly like a normal `skiff install`.
+    let base_outcome = install::install_manifest(
+        &Client::plain(),
+        &build_info(&cdn.base),
+        &game(),
+        &parsed,
+        &base_raw,
+        &opts,
+        None,
+    )
+    .expect("main game install should succeed");
+    assert_eq!(base_outcome.components, 1);
+
+    let main_guid_before = install::load_installed_components(&dir).unwrap()[0].guid.clone();
+    let main_item_before = item_for(&dir, "E2EGame");
+    let file_a_before = std::fs::read(dir.join("a.bin")).unwrap();
+    let file_b_before = std::fs::read(dir.join("sub/b.bin")).unwrap();
+
+    // 2. Add the add-on to that directory.
+    let addon = InstallComponent {
+        game: dlc_game(),
+        build: addon_build(&cdn.base),
+        manifest: addon_manifest,
+        raw: addon_raw,
+    };
+    let outcome =
+        install::add_components_to_install(&Client::plain(), &game(), &[addon], &opts, None)
+            .expect("add-on install should succeed");
+
+    assert_eq!(outcome.components, 2);
+    assert_eq!(outcome.dlc_apps, vec!["E2EDlc".to_string()]);
+    assert_eq!(outcome.files, 3, "two main-game files plus one add-on file");
+    assert_eq!(outcome.conflicts, 0);
+    // The add-on shares one chunk with the main game. That chunk is fetched once and scattered to
+    // both files (the new file has no bytes there yet); the add-on's own chunk comes with it.
+    assert_eq!(
+        outcome.chunks_downloaded, 2,
+        "only the add-on's chunks are fetched, never the main game's own chunk set"
+    );
+
+    // The main game is byte-identical and its launcher entry was not rewritten.
+    assert_eq!(std::fs::read(dir.join("a.bin")).unwrap(), file_a_before);
+    assert_eq!(std::fs::read(dir.join("sub/b.bin")).unwrap(), file_b_before);
+    assert_eq!(item_for(&dir, "E2EGame"), main_item_before);
+    assert_eq!(
+        install::load_installed_components(&dir).unwrap()[0].guid,
+        main_guid_before
+    );
+
+    // The add-on's files landed, and its metadata points at the existing main-game identity.
+    assert_eq!(std::fs::read(dir.join("dlc/c.bin")).unwrap(), addon_content);
+    let components = install::load_installed_components(&dir).unwrap();
+    assert_eq!(components.len(), 2);
+    let main = components.iter().find(|component| component.is_main_game()).unwrap();
+    let added = components.iter().find(|component| component.app_name == "E2EDlc").unwrap();
+    assert_eq!(added.main_app_name, "E2EGame");
+    assert_eq!(added.guid, added.item["InstallationGuid"].as_str().unwrap());
+    assert_eq!(
+        added.item["HostInstallationGuid"].as_str().unwrap(),
+        main.guid,
+        "the add-on must reuse the main game's InstallationGuid"
+    );
+
+    // Adding the same add-on again is a no-op, not a second download.
+    let addon_again = InstallComponent {
+        game: dlc_game(),
+        build: addon_build(&cdn.base),
+        manifest: Manifest::parse(&components[0].raw).unwrap(),
+        raw: components[0].raw.clone(),
+    };
+    assert!(
+        install::add_components_to_install(&Client::plain(), &game(), &[addon_again], &opts, None)
+            .is_err(),
+        "re-adding an installed add-on must not run an install"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
