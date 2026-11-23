@@ -128,7 +128,7 @@ fn extract_auth_code(input: &str) -> String {
 
 /// Human label and coarse fraction for a stage id reported by `skiff-core`.
 ///
-/// The core emits UI-neutral ids so the CLI and the web page can ignore them; the wording and the
+/// The core emits UI-neutral ids so the CLI can ignore them; the wording and the
 /// weighting of the bar live here.
 fn stage_label(stage: &str) -> (&'static str, f32) {
     match stage {
@@ -567,7 +567,7 @@ impl Library {
 
         let needle = self.query.trim().to_lowercase();
         // Group-level matching: a group survives when its main game *or* any of its add-ons
-        // matches, and then the whole group is shown (same rule the web page uses).
+        // matches, and then the whole group is shown (same rule the library list uses).
         let view = if needle.is_empty() { full_view } else { full_view.filtered(&needle) };
 
         let filtered_games: Vec<GameGroup> = view

@@ -570,7 +570,7 @@ pub fn load_tokens() -> Result<Option<TokenSet>> {
         store.accounts.values().next().cloned()
     };
     // Token stores written before the `dn` fallback existed have an empty display name; repair them
-    // in memory so every caller (CLI, GUI, web UI) shows the account name without a re-login.
+    // in memory so every caller (CLI, GUI) shows the account name without a re-login.
     if let Some(tokens) = tokens.as_mut() {
         tokens.backfill_display_name();
     }

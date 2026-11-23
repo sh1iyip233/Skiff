@@ -8,9 +8,8 @@
 
 ## 都有什么功能
 
-- **三种使用方式**：
+- **两种使用方式**：
   - 桌面客户端（Slint 自绘界面，`skiff-ui.exe`，不依赖 WebView2，不用管理员权限）
-  - 本地网页界面（`skiff serve --open`，浏览器里直接用）
   - 命令行（`skiff.exe`）
 - **账号登录**：通过浏览器授权码登录，token 用 Windows DPAPI 按当前用户加密保存在本地，过期自动刷新。
 - **游戏库与封面**：拉取游戏库，按 Epic 目录的 `mainGameItem` 自动把 DLC 归到对应主游戏下面；桌面端以封面网格展示主游戏，附加内容单独一栏，封面按需下载并缓存到本地。安装主游戏时默认把已拥有的 DLC 一起装进同一目录（加 `--no-dlc` 可关闭）。
@@ -24,10 +23,10 @@
 
 ### 图形界面
 
-编译好之后直接运行 `skiff-ui.exe` 即可，或者用命令行起一个本地网页版：
+编译好之后直接运行 `skiff-ui.exe` 即可：
 
 ```powershell
-skiff serve --open
+skiff-ui.exe
 ```
 
 ### 命令行
@@ -142,7 +141,6 @@ skiff verify <installDir> [--repair]
 skiff uninstall <installDir> [--keep-files]
 skiff register <installDir>
 skiff config get | set <key> <value> | list
-skiff serve [--port <n>] [--open]
 skiff debug manifest <file> [--json]
 skiff debug cdn-probe <appName>
 ```

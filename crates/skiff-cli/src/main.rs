@@ -18,8 +18,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-mod web;
-
 const USAGE: &str = "\
 skiff - third-party Epic Games library downloader
 
@@ -40,7 +38,6 @@ USAGE:
   skiff uninstall <installDir> [--keep-files]
   skiff register <installDir>
   skiff config get | set <key> <value> | list
-  skiff serve [--port <n>] [--open]
   skiff debug manifest <file> [--json]
   skiff debug cdn-probe <appName>
 
@@ -91,7 +88,7 @@ impl Args {
                 } else if matches!(
                     rest,
                     "json" | "no-progress" | "verify" | "repair" | "register-launcher" | "keep-files"
-                        | "device-code" | "yes" | "verbose" | "auto-concurrency" | "open"
+                        | "device-code" | "yes" | "verbose" | "auto-concurrency"
                         | "refresh" | "all" | "no-dlc" | "dir-is-exact" | "dry-run"
                 ) || rest == "y"
                 {
@@ -170,7 +167,6 @@ fn run() -> Result<()> {
         Some("uninstall") => cmd_uninstall(&args, &cfg),
         Some("register") => cmd_register(&args),
         Some("config") => cmd_config(&args, &cfg),
-        Some("serve") => cmd_serve(&args, &cfg),
         Some("debug") => cmd_debug(&args, &cfg, json),
         Some("help") | Some("-h") | Some("--help") => {
             println!("{USAGE}");
@@ -1214,15 +1210,6 @@ fn cmd_register(args: &Args) -> Result<()> {
 // ---------------------------------------------------------------------------------------------
 // config
 // ---------------------------------------------------------------------------------------------
-
-/// Start the local web UI (loopback only).
-fn cmd_serve(args: &Args, cfg: &Config) -> Result<()> {
-    let port = args.usize_flag("port")?.unwrap_or(8790);
-    if port == 0 || port > 65535 {
-        return Err(Error::usage("--port must be between 1 and 65535"));
-    }
-    web::serve(cfg, port as u16, args.has("open"))
-}
 
 fn cmd_config(args: &Args, cfg: &Config) -> Result<()> {
     let mut cfg = cfg.clone();
