@@ -157,7 +157,8 @@ component Chip inherits Rectangle {
     }
 }
 
-// Download phase pill; `kind` matches main.rs phase_kind mapping.
+// Download phase pill; `kind` matches main.rs phase_kind mapping:
+// 1 = downloading, 2 = complete, 3 = failed, 4 = paused, 5 = verifying.
 component PhaseChip inherits Rectangle {
     in property <string> label;
     in property <int> kind;
@@ -169,12 +170,14 @@ component PhaseChip inherits Rectangle {
         : root.kind == 2 ? Theme.ok-soft
         : root.kind == 3 ? Theme.err-soft
         : root.kind == 4 ? Theme.warn-soft
+        : root.kind == 5 ? #173a3a
         : #1a212c;
     border-width: 1px;
     border-color: root.kind == 1 ? #2d4b7c
         : root.kind == 2 ? #205c45
         : root.kind == 3 ? #5c272e
         : root.kind == 4 ? #5c461d
+        : root.kind == 5 ? #2a6060
         : Theme.line;
 
     HorizontalLayout {
@@ -187,6 +190,7 @@ component PhaseChip inherits Rectangle {
                 : root.kind == 2 ? Theme.ok
                 : root.kind == 3 ? Theme.err
                 : root.kind == 4 ? Theme.warn
+                : root.kind == 5 ? #7fe0d5
                 : Theme.muted;
             font-size: 11px;
             font-weight: 600;
@@ -550,7 +554,7 @@ component MiniDownloadCard inherits Rectangle {
                 HorizontalLayout {
                     spacing: 4px;
                     Text {
-                        text: root.running ? root.percent-text : "已暂停 · " + root.percent-text;
+                        text: root.running ? root.phase + " · " + root.percent-text : "已暂停 · " + root.percent-text;
                         color: root.running ? #9cc0ff : Theme.warn;
                         font-size: 10px;
                         font-weight: 700;
@@ -1273,6 +1277,11 @@ export component AppWindow inherits Window {
     in property <string> bytes-text: "—";
     in property <string> chunks-text: "—";
     in property <string> inflight-text: "—";
+    // Captions of the telemetry grid; they follow the active stage (download / verify / repair).
+    in property <string> speed-label: "下载速度";
+    in property <string> bytes-label: "已下载 / 总计";
+    in property <string> chunks-label: "分块进度";
+    in property <string> inflight-label: "在途 / 峰值并发";
     in property <string> elapsed-text: "—";
     in property <string> retries-text: "";
     in property <string> note: "";
@@ -1865,6 +1874,7 @@ export component AppWindow inherits Window {
                                                 background: root.phase-kind == 2 ? @linear-gradient(90deg, #27b87d 0%, #52e5a8 100%)
                                                     : root.phase-kind == 4 ? @linear-gradient(90deg, #c98c32 0%, #f0b45a 100%)
                                                     : root.phase-kind == 3 ? @linear-gradient(90deg, #c94652 0%, #f26d78 100%)
+                                                    : root.phase-kind == 5 ? @linear-gradient(90deg, #17a398 0%, #4fe3d0 100%)
                                                     : @linear-gradient(90deg, #3f7ff0 0%, #7cc0ff 100%);
                                                 animate width { duration: 220ms; }
                                             }
@@ -1883,13 +1893,13 @@ export component AppWindow inherits Window {
                                 GridLayout {
                                     spacing: 12px;
                                     Row {
-                                        MetricTile { label: "下载速度"; value: root.speed; highlight: root.job-running; horizontal-stretch: 1; }
+                                        MetricTile { label: root.speed-label; value: root.speed; highlight: root.job-running; horizontal-stretch: 1; }
                                         MetricTile { label: "预计剩余"; value: root.eta; horizontal-stretch: 1; }
-                                        MetricTile { label: "已下载 / 总计"; value: root.bytes-text; horizontal-stretch: 1; }
+                                        MetricTile { label: root.bytes-label; value: root.bytes-text; horizontal-stretch: 1; }
                                     }
                                     Row {
-                                        MetricTile { label: "分块进度"; value: root.chunks-text; horizontal-stretch: 1; }
-                                        MetricTile { label: "在途 / 峰值并发"; value: root.inflight-text; horizontal-stretch: 1; }
+                                        MetricTile { label: root.chunks-label; value: root.chunks-text; horizontal-stretch: 1; }
+                                        MetricTile { label: root.inflight-label; value: root.inflight-text; horizontal-stretch: 1; }
                                         MetricTile { label: "已用时间"; value: root.elapsed-text; horizontal-stretch: 1; }
                                     }
                                 }

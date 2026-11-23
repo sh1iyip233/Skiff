@@ -7,7 +7,9 @@ use skiff_core::api::{BuildInfo, GameEntry};
 use skiff_core::cdn::{chunk_path, CdnHosts};
 use skiff_core::chunk;
 use skiff_core::config::Concurrency;
-use skiff_core::download::{self, ChunkJob, ChunkSink, DownloadOptions, ProgressTracker};
+use skiff_core::download::{
+    self, ChunkJob, ChunkSink, DownloadOptions, Phase, Progress, ProgressTracker,
+};
 use skiff_core::http::Client;
 use skiff_core::install::{self, InstallComponent, InstallOptions};
 use skiff_core::manifest::{ChunkInfo, ChunkPart, FileManifest, Manifest, ManifestMeta};
@@ -16,7 +18,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 // ---------------------------------------------------------------------------------------------
@@ -390,6 +392,49 @@ fn installs_files_and_writes_egstore() {
 }
 
 #[test]
+fn install_reports_download_then_verify_phases() {
+    let (_, raw, containers, _) = fixtures();
+    let parsed = Manifest::parse(&raw).unwrap();
+    let cdn = MockCdn::start(containers);
+    let dir = temp_dir("phases");
+    let opts = options(&dir, 2);
+
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let callback = {
+        let seen = seen.clone();
+        Arc::new(move |progress: Progress| seen.lock().unwrap().push(progress))
+            as Arc<dyn Fn(Progress) + Send + Sync>
+    };
+    install::install_manifest(
+        &Client::plain(),
+        &build_info(&cdn.base),
+        &game(),
+        &parsed,
+        &raw,
+        &opts,
+        Some(callback),
+    )
+    .expect("install should succeed");
+
+    let events = seen.lock().unwrap();
+    assert!(
+        events.iter().any(|event| event.phase == Phase::Download),
+        "the download stage should report progress"
+    );
+    let last_verify = events
+        .iter()
+        .rev()
+        .find(|event| event.phase == Phase::Verify)
+        .expect("the verification stage should report progress");
+    assert_eq!(last_verify.verify.files_done, 2);
+    assert_eq!(last_verify.verify.files_total, 2);
+    assert_eq!(last_verify.verify.bytes_done, last_verify.verify.bytes_total);
+    assert_eq!(last_verify.verify.threads, opts.concurrency.verify_threads());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn concurrency_is_never_exceeded_and_one_is_serial() {
     let (_, raw, containers, _) = fixtures();
     let parsed = Manifest::parse(&raw).unwrap();
@@ -508,6 +553,12 @@ fn repair_redownloads_only_damaged_chunks() {
     .unwrap();
 
     let cdn = MockCdn::start(containers);
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let callback = {
+        let seen = seen.clone();
+        Arc::new(move |progress: Progress| seen.lock().unwrap().push(progress))
+            as Arc<dyn Fn(Progress) + Send + Sync>
+    };
     let outcome = install::install_manifest(
         &Client::plain(),
         &build_info(&cdn.base),
@@ -515,7 +566,7 @@ fn repair_redownloads_only_damaged_chunks() {
         &parsed,
         &raw,
         &opts,
-        None,
+        Some(callback),
     )
     .unwrap();
 
@@ -523,6 +574,9 @@ fn repair_redownloads_only_damaged_chunks() {
         outcome.repaired_chunks, 3,
         "only the three chunks backing the damaged file should be refetched"
     );
+    let phases: Vec<Phase> = seen.lock().unwrap().iter().map(|event| event.phase).collect();
+    assert!(phases.contains(&Phase::Verify), "verification should report progress");
+    assert!(phases.contains(&Phase::Repair), "the repair download should report progress");
     let repaired = std::fs::read(&target).unwrap();
     assert_eq!(sha1(&repaired).to_vec(), parsed.files[1].hash.to_vec());
 

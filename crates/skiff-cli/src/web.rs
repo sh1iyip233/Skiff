@@ -9,7 +9,7 @@
 use skiff_core::api::{Api, GameEntry};
 use skiff_core::auth;
 use skiff_core::config::Config;
-use skiff_core::download::Progress;
+use skiff_core::download::{Phase, Progress};
 use skiff_core::error::{Error, Result};
 use skiff_core::http::Client;
 use skiff_core::install::{self, InstallOptions, InstallOutcome};
@@ -62,6 +62,8 @@ struct JobState {
 
 #[derive(Default, Clone)]
 struct ProgressSnapshot {
+    /// `download`, `verify` or `repair`.
+    phase: String,
     chunks_total: usize,
     chunks_done: usize,
     bytes_total: u64,
@@ -70,11 +72,24 @@ struct ProgressSnapshot {
     peak_inflight: usize,
     speed_bps: f64,
     eta_secs: f64,
+    verify_files_total: usize,
+    verify_files_done: usize,
+    verify_bytes_total: u64,
+    verify_bytes_done: u64,
+    verify_speed_bps: f64,
+    verify_eta_secs: f64,
+    verify_threads: usize,
 }
 
 impl From<&Progress> for ProgressSnapshot {
     fn from(p: &Progress) -> Self {
         ProgressSnapshot {
+            phase: match p.phase {
+                Phase::Download => "download",
+                Phase::Verify => "verify",
+                Phase::Repair => "repair",
+            }
+            .to_string(),
             chunks_total: p.chunks_total,
             chunks_done: p.chunks_done,
             bytes_total: p.bytes_total,
@@ -83,6 +98,13 @@ impl From<&Progress> for ProgressSnapshot {
             peak_inflight: p.peak_inflight,
             speed_bps: p.speed_bps,
             eta_secs: p.eta_secs.unwrap_or(0.0),
+            verify_files_total: p.verify.files_total,
+            verify_files_done: p.verify.files_done,
+            verify_bytes_total: p.verify.bytes_total,
+            verify_bytes_done: p.verify.bytes_done,
+            verify_speed_bps: p.verify.speed_bps,
+            verify_eta_secs: p.verify.eta_secs.unwrap_or(0.0),
+            verify_threads: p.verify.threads,
         }
     }
 }
@@ -318,6 +340,7 @@ fn job_json(job: &JobState) -> serde_json::Value {
         "title": job.title,
         "error": job.error,
         "summary": job.summary,
+        "phase": p.phase,
         "chunks_total": p.chunks_total,
         "chunks_done": p.chunks_done,
         "bytes_total": p.bytes_total,
@@ -326,6 +349,13 @@ fn job_json(job: &JobState) -> serde_json::Value {
         "peak_inflight": p.peak_inflight,
         "speed_bps": p.speed_bps,
         "eta_secs": p.eta_secs,
+        "verify_files_total": p.verify_files_total,
+        "verify_files_done": p.verify_files_done,
+        "verify_bytes_total": p.verify_bytes_total,
+        "verify_bytes_done": p.verify_bytes_done,
+        "verify_speed_bps": p.verify_speed_bps,
+        "verify_eta_secs": p.verify_eta_secs,
+        "verify_threads": p.verify_threads,
     })
 }
 

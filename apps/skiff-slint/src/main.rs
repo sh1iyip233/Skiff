@@ -16,7 +16,7 @@ use covers::CoverLoader;
 use skiff_core::api::{Api, GameEntry, StageHook};
 use skiff_core::auth;
 use skiff_core::config::Config;
-use skiff_core::download::Progress;
+use skiff_core::download::{Phase, Progress};
 use skiff_core::http::Client;
 use skiff_core::install::{self, InstallOptions};
 use skiff_core::library::{self, GameGroup};
@@ -452,6 +452,12 @@ struct Snapshot {
     bytes: String,
     chunks: String,
     inflight: String,
+    // Labels of the telemetry tiles: the same six tiles describe the download, verification and
+    // repair stages, so their captions follow the active phase.
+    speed_label: String,
+    bytes_label: String,
+    chunks_label: String,
+    inflight_label: String,
     elapsed: String,
     retries: String,
     note: String,
@@ -636,6 +642,10 @@ impl Snapshot {
             bytes: "—".to_string(),
             chunks: "—".to_string(),
             inflight: "—".to_string(),
+            speed_label: "下载速度".to_string(),
+            bytes_label: "已下载 / 总计".to_string(),
+            chunks_label: "分块进度".to_string(),
+            inflight_label: "在途 / 峰值并发".to_string(),
             elapsed: "—".to_string(),
             account_name: "未登录".to_string(),
             account_initial: "?".to_string(),
@@ -901,6 +911,121 @@ fn push_selection(ui: &AppWindow, state: &State) {
 // install job
 // ---------------------------------------------------------------------------------------------
 
+fn ratio_of(done: u64, total: u64) -> f32 {
+    if total == 0 {
+        0.0
+    } else {
+        (done as f32 / total as f32).clamp(0.0, 1.0)
+    }
+}
+
+fn format_percent(ratio: f32) -> String {
+    format!("{:.1}%", ratio * 100.0)
+}
+
+/// Copy one core progress snapshot into the UI state.
+///
+/// The download page has a single progress surface but three stages (download, verification and
+/// repair), so the numbers and the telemetry captions follow `progress.phase`. `job_started` keeps
+/// "已用时间" a total for the whole task instead of resetting when verification starts.
+fn apply_progress(snapshot: &mut Snapshot, progress: &Progress, job_started: Instant) {
+    snapshot.elapsed = human_duration(job_started.elapsed().as_secs_f64());
+    snapshot.indeterminate = false;
+    match progress.phase {
+        Phase::Download => apply_download_progress(snapshot, progress),
+        Phase::Verify => apply_verify_progress(snapshot, progress),
+        Phase::Repair => apply_repair_progress(snapshot, progress),
+    }
+}
+
+fn apply_download_progress(snapshot: &mut Snapshot, progress: &Progress) {
+    let ratio = ratio_of(progress.bytes_done, progress.bytes_total);
+    snapshot.phase = "下载中".to_string();
+    snapshot.phase_kind = 1;
+    snapshot.progress = ratio;
+    snapshot.percent = format_percent(ratio);
+    snapshot.speed = format!("{}/s", human_bytes(progress.speed_bps as u64));
+    snapshot.bytes = format!(
+        "{} / {}",
+        human_bytes(progress.bytes_done),
+        human_bytes(progress.bytes_total)
+    );
+    snapshot.chunks = format!("{} / {}", progress.chunks_done, progress.chunks_total);
+    snapshot.inflight = format!("{} / {}", progress.inflight, progress.peak_inflight);
+    snapshot.eta = progress.eta_secs.map(human_duration).unwrap_or_else(|| "—".to_string());
+    snapshot.retries = if progress.retries > 0 {
+        format!("已重试 {} 次（网络抖动，属正常）", progress.retries)
+    } else {
+        String::new()
+    };
+    snapshot.speed_label = "下载速度".to_string();
+    snapshot.bytes_label = "已下载 / 总计".to_string();
+    snapshot.chunks_label = "分块进度".to_string();
+    snapshot.inflight_label = "在途 / 峰值并发".to_string();
+    if ratio > 0.0 {
+        // The "解析构建 / 探测 CDN" hint is no longer true.
+        snapshot.note.clear();
+    }
+}
+
+fn apply_verify_progress(snapshot: &mut Snapshot, progress: &Progress) {
+    let verify = &progress.verify;
+    // Zero-byte files still leave a meaningful file-count progress.
+    let ratio = if verify.bytes_total > 0 {
+        ratio_of(verify.bytes_done, verify.bytes_total)
+    } else {
+        ratio_of(verify.files_done as u64, verify.files_total as u64)
+    };
+    snapshot.phase = "校验中".to_string();
+    snapshot.phase_kind = 5;
+    snapshot.progress = ratio;
+    snapshot.percent = format_percent(ratio);
+    snapshot.speed = format!("{}/s", human_bytes(verify.speed_bps as u64));
+    snapshot.eta = verify.eta_secs.map(human_duration).unwrap_or_else(|| "—".to_string());
+    snapshot.bytes = format!(
+        "已校验 {} / {}",
+        human_bytes(verify.bytes_done),
+        human_bytes(verify.bytes_total)
+    );
+    snapshot.chunks = format!("{} / {}", verify.files_done, verify.files_total);
+    snapshot.inflight = format!("{} 线程", verify.threads);
+    snapshot.retries.clear();
+    snapshot.speed_label = "校验速度".to_string();
+    snapshot.bytes_label = "已校验 / 总计".to_string();
+    snapshot.chunks_label = "文件进度".to_string();
+    snapshot.inflight_label = "校验线程".to_string();
+    snapshot.note = "文件已下载完成，正在逐文件校验完整性…".to_string();
+    snapshot.note_error = false;
+}
+
+fn apply_repair_progress(snapshot: &mut Snapshot, progress: &Progress) {
+    let ratio = ratio_of(progress.bytes_done, progress.bytes_total);
+    snapshot.phase = "修复中".to_string();
+    snapshot.phase_kind = 1;
+    snapshot.progress = ratio;
+    snapshot.percent = format_percent(ratio);
+    snapshot.speed = format!("{}/s", human_bytes(progress.speed_bps as u64));
+    snapshot.eta = progress.eta_secs.map(human_duration).unwrap_or_else(|| "—".to_string());
+    snapshot.bytes = format!(
+        "已修复 {} / {}",
+        human_bytes(progress.bytes_done),
+        human_bytes(progress.bytes_total)
+    );
+    snapshot.chunks = format!("{} / {}", progress.chunks_done, progress.chunks_total);
+    snapshot.inflight = format!("{} / {}", progress.inflight, progress.peak_inflight);
+    snapshot.retries = if progress.retries > 0 {
+        format!("修复重试 {} 次", progress.retries)
+    } else {
+        String::new()
+    };
+    snapshot.speed_label = "修复速度".to_string();
+    snapshot.bytes_label = "已修复 / 总计".to_string();
+    snapshot.chunks_label = "分块进度".to_string();
+    snapshot.inflight_label = "在途 / 峰值并发".to_string();
+    snapshot.note = "校验发现损坏的分块，正在重新下载…".to_string();
+    snapshot.note_error = false;
+}
+
 /// Start installing one main game and mirror the job identity into the snapshot.
 ///
 /// The download/verify work stays in `skiff-core`; this function only prepares the worker and the
@@ -951,6 +1076,10 @@ fn begin_install(
         snapshot.bytes = "—".to_string();
         snapshot.chunks = "—".to_string();
         snapshot.inflight = "—".to_string();
+        snapshot.speed_label = "下载速度".to_string();
+        snapshot.bytes_label = "已下载 / 总计".to_string();
+        snapshot.chunks_label = "分块进度".to_string();
+        snapshot.inflight_label = "在途 / 峰值并发".to_string();
         snapshot.elapsed = "0 秒".to_string();
         snapshot.retries.clear();
         snapshot.note = if dlcs.is_empty() {
@@ -988,57 +1117,16 @@ fn begin_install(
                 register_launcher: cfg.register_launcher,
             };
 
+            let job_started = Instant::now();
             let progress_state = worker_state.clone();
             let callback = Arc::new(move |progress: Progress| {
                 if let Ok(mut snapshot) = progress_state.snapshot.lock() {
                     // A stop is in flight; keep the 暂停中/取消中 state instead of overwriting it
-                    // with fresh download numbers.
+                    // with fresh progress numbers.
                     if progress_state.stopping.load(Ordering::Relaxed) {
                         return;
                     }
-                    let ratio = if progress.bytes_total > 0 {
-                        progress.bytes_done as f32 / progress.bytes_total as f32
-                    } else {
-                        0.0
-                    };
-                    let ratio = ratio.clamp(0.0, 1.0);
-                    snapshot.progress = ratio;
-                    snapshot.indeterminate = false;
-                    snapshot.percent = format!("{:.1}%", ratio * 100.0);
-                    snapshot.speed = format!("{}/s", human_bytes(progress.speed_bps as u64));
-                    snapshot.bytes = format!(
-                        "{} / {}",
-                        human_bytes(progress.bytes_done),
-                        human_bytes(progress.bytes_total)
-                    );
-                    snapshot.chunks =
-                        format!("{} / {}", progress.chunks_done, progress.chunks_total);
-                    snapshot.inflight =
-                        format!("{} / {}", progress.inflight, progress.peak_inflight);
-                    snapshot.elapsed = human_duration(progress.elapsed_secs);
-                    snapshot.retries = if progress.retries > 0 {
-                        format!("已重试 {} 次（网络抖动，属正常）", progress.retries)
-                    } else {
-                        String::new()
-                    };
-                    // Two phases share one byte counter: once every byte has landed the install is
-                    // verifying files and writing `.egstore`.
-                    let verifying =
-                        progress.bytes_total > 0 && progress.bytes_done >= progress.bytes_total;
-                    snapshot.phase = if verifying { "校验中" } else { "下载中" }.to_string();
-                    snapshot.phase_kind = 1;
-                    snapshot.eta = if verifying {
-                        "—".to_string()
-                    } else {
-                        progress
-                            .eta_secs
-                            .map(human_duration)
-                            .unwrap_or_else(|| "—".to_string())
-                    };
-                    if ratio > 0.0 {
-                        // The "解析构建 / 探测 CDN" hint is no longer true.
-                        snapshot.note.clear();
-                    }
+                    apply_progress(&mut snapshot, &progress, job_started);
                 }
             }) as Arc<dyn Fn(Progress) + Send + Sync>;
 
@@ -1051,12 +1139,17 @@ fn begin_install(
             snapshot.running = false;
             snapshot.indeterminate = false;
             snapshot.eta = "—".to_string();
+            snapshot.speed_label = "下载速度".to_string();
+            snapshot.bytes_label = "已下载 / 总计".to_string();
+            snapshot.chunks_label = "分块进度".to_string();
+            snapshot.inflight_label = "在途 / 峰值并发".to_string();
             match result {
                 Ok(outcome) => {
                     snapshot.phase = "完成".to_string();
                     snapshot.phase_kind = 2;
                     snapshot.progress = 1.0;
                     snapshot.percent = "100.0%".to_string();
+                    snapshot.speed = "—".to_string();
                     let dlc = if outcome.dlc_apps.is_empty() {
                         String::new()
                     } else {
@@ -1523,7 +1616,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 if snapshot.running {
                     snapshot.phase = "暂停中…".to_string();
                     snapshot.phase_kind = 1;
-                    snapshot.note = "正在停止下载，已下载的进度会保留…".to_string();
+                    snapshot.note = "正在停止当前任务，已完成的进度会保留…".to_string();
                     snapshot.note_error = false;
                 }
             });
@@ -1728,6 +1821,10 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_bytes_text(SharedString::from(snapshot.bytes.clone()));
             ui.set_chunks_text(SharedString::from(snapshot.chunks.clone()));
             ui.set_inflight_text(SharedString::from(snapshot.inflight.clone()));
+            ui.set_speed_label(SharedString::from(snapshot.speed_label.clone()));
+            ui.set_bytes_label(SharedString::from(snapshot.bytes_label.clone()));
+            ui.set_chunks_label(SharedString::from(snapshot.chunks_label.clone()));
+            ui.set_inflight_label(SharedString::from(snapshot.inflight_label.clone()));
             ui.set_elapsed_text(SharedString::from(snapshot.elapsed.clone()));
             ui.set_retries_text(SharedString::from(snapshot.retries.clone()));
             ui.set_note(SharedString::from(snapshot.note.clone()));
@@ -2020,5 +2117,108 @@ mod tests {
         // Different names usually get different tones, but the palette is intentionally small;
         // only determinism is a contract here.
         let _ = tone_for("Other");
+    }
+
+    #[test]
+    fn download_progress_maps_bytes_to_the_bar() {
+        let mut snapshot = Snapshot::idle();
+        let progress = Progress {
+            phase: Phase::Download,
+            chunks_total: 10,
+            chunks_done: 4,
+            bytes_total: 200,
+            bytes_done: 50,
+            inflight: 3,
+            peak_inflight: 8,
+            speed_bps: 1024.0,
+            eta_secs: Some(120.0),
+            ..Default::default()
+        };
+        apply_progress(&mut snapshot, &progress, Instant::now());
+
+        assert_eq!(snapshot.phase, "下载中");
+        assert_eq!(snapshot.phase_kind, 1);
+        assert!((snapshot.progress - 0.25).abs() < 0.001);
+        assert_eq!(snapshot.percent, "25.0%");
+        assert_eq!(snapshot.chunks, "4 / 10");
+        assert_eq!(snapshot.inflight, "3 / 8");
+        assert_eq!(snapshot.speed_label, "下载速度");
+        assert_eq!(snapshot.bytes_label, "已下载 / 总计");
+        assert_eq!(snapshot.chunks_label, "分块进度");
+        assert_eq!(snapshot.inflight_label, "在途 / 峰值并发");
+        assert_eq!(snapshot.eta, "2 分 0 秒");
+        assert!(snapshot.note.is_empty());
+    }
+
+    #[test]
+    fn verify_progress_uses_verify_counters_and_labels() {
+        let mut snapshot = Snapshot::idle();
+        let progress = Progress {
+            phase: Phase::Verify,
+            verify: skiff_core::download::VerifyProgress {
+                files_total: 8,
+                files_done: 2,
+                bytes_total: 1000,
+                bytes_done: 250,
+                speed_bps: 2048.0,
+                eta_secs: Some(1.5),
+                threads: 4,
+            },
+            ..Default::default()
+        };
+        apply_progress(&mut snapshot, &progress, Instant::now());
+
+        assert_eq!(snapshot.phase, "校验中");
+        assert_eq!(snapshot.phase_kind, 5);
+        assert!((snapshot.progress - 0.25).abs() < 0.001);
+        assert_eq!(snapshot.percent, "25.0%");
+        assert_eq!(snapshot.chunks, "2 / 8");
+        assert_eq!(snapshot.inflight, "4 线程");
+        assert_eq!(snapshot.speed_label, "校验速度");
+        assert_eq!(snapshot.bytes_label, "已校验 / 总计");
+        assert_eq!(snapshot.chunks_label, "文件进度");
+        assert_eq!(snapshot.inflight_label, "校验线程");
+        assert!(snapshot.retries.is_empty());
+        assert!(snapshot.note.contains("校验"));
+    }
+
+    #[test]
+    fn zero_byte_verification_falls_back_to_file_counts() {
+        let mut snapshot = Snapshot::idle();
+        let progress = Progress {
+            phase: Phase::Verify,
+            verify: skiff_core::download::VerifyProgress {
+                files_total: 4,
+                files_done: 1,
+                threads: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        apply_progress(&mut snapshot, &progress, Instant::now());
+
+        assert!((snapshot.progress - 0.25).abs() < 0.001);
+        assert_eq!(snapshot.percent, "25.0%");
+    }
+
+    #[test]
+    fn repair_progress_reads_like_a_repair() {
+        let mut snapshot = Snapshot::idle();
+        let progress = Progress {
+            phase: Phase::Repair,
+            chunks_total: 5,
+            chunks_done: 1,
+            bytes_total: 100,
+            bytes_done: 20,
+            ..Default::default()
+        };
+        apply_progress(&mut snapshot, &progress, Instant::now());
+
+        assert_eq!(snapshot.phase, "修复中");
+        assert_eq!(snapshot.phase_kind, 1);
+        assert_eq!(snapshot.percent, "20.0%");
+        assert_eq!(snapshot.speed_label, "修复速度");
+        assert_eq!(snapshot.bytes_label, "已修复 / 总计");
+        assert!(snapshot.note.contains("重新下载"));
     }
 }

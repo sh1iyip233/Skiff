@@ -34,7 +34,39 @@ pub trait ChunkSink: Send + Sync {
     fn write_chunk(&self, index: usize, plaintext: &[u8]) -> Result<()>;
 }
 
-/// Snapshot of download progress.
+/// Which stage of an install a [`Progress`] snapshot describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Phase {
+    /// Chunks are being fetched from the CDN.
+    #[default]
+    Download,
+    /// Files are being hashed and compared against the manifest.
+    Verify,
+    /// Chunks that failed verification are being fetched again.
+    Repair,
+}
+
+/// Progress of one verification pass.
+///
+/// Verification reads every byte of every file, so byte counts advance even while a single huge
+/// file is being hashed; the file counters answer "how many files are left".
+#[derive(Debug, Clone, Default)]
+pub struct VerifyProgress {
+    pub files_total: usize,
+    pub files_done: usize,
+    pub bytes_total: u64,
+    pub bytes_done: u64,
+    pub speed_bps: f64,
+    pub eta_secs: Option<f64>,
+    /// Verify worker threads in use for this pass.
+    pub threads: usize,
+}
+
+/// Snapshot of the current install stage.
+///
+/// `chunks_*` / `bytes_*` / `inflight` describe the download engine and are used by the
+/// [`Phase::Download`] and [`Phase::Repair`] stages. A [`Phase::Verify`] snapshot carries its
+/// counters in [`Progress::verify`] instead.
 #[derive(Debug, Clone, Default)]
 pub struct Progress {
     pub chunks_total: usize,
@@ -48,6 +80,10 @@ pub struct Progress {
     pub eta_secs: Option<f64>,
     /// Total chunk attempts that had to be retried.
     pub retries: usize,
+    /// Stage this snapshot belongs to.
+    pub phase: Phase,
+    /// Counters for [`Phase::Verify`]; empty during download and repair.
+    pub verify: VerifyProgress,
 }
 
 /// Shared counters updated by every worker.
@@ -113,6 +149,8 @@ impl ProgressTracker {
             speed_bps: speed,
             eta_secs: if speed > 1.0 { Some(remaining as f64 / speed) } else { None },
             retries: self.retries.load(Ordering::Acquire),
+            phase: Phase::Download,
+            verify: VerifyProgress::default(),
         }
     }
 }
@@ -486,6 +524,9 @@ mod tests {
         assert_eq!(snap.bytes_done, 100);
         assert_eq!(snap.peak_inflight, 2);
         assert!(snap.speed_bps > 0.0);
+        assert_eq!(snap.phase, Phase::Download);
+        assert_eq!(snap.verify.files_total, 0);
+        assert_eq!(snap.verify.bytes_total, 0);
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use skiff_core::api::{Api, GameEntry};
 use skiff_core::config::{Config, Concurrency};
-use skiff_core::download::Progress;
+use skiff_core::download::{Phase, Progress};
 use skiff_core::error::{Error, Result};
 use skiff_core::http::Client;
 use skiff_core::install::{self, InstallOptions};
@@ -1118,7 +1118,23 @@ fn cmd_verify(args: &Args, cfg: &Config) -> Result<()> {
             repair: true,
             register_launcher: false,
         };
-        let outcome = install::install_bundle(&client, &api, &choice.base, &dlcs, &options, None)?;
+        let interactive = !args.has("no-progress") && std::io::stdout().is_terminal();
+        let ui = Arc::new(std::sync::Mutex::new(ProgressUi::new(interactive)));
+        let callback = {
+            let ui = ui.clone();
+            Arc::new(move |progress: Progress| {
+                if let Ok(mut ui) = ui.lock() {
+                    ui.render(&progress);
+                }
+            }) as Arc<dyn Fn(Progress) + Send + Sync>
+        };
+        let result =
+            install::install_bundle(&client, &api, &choice.base, &dlcs, &options, Some(callback));
+        if interactive {
+            let mut ui = ui.lock().unwrap();
+            ui.finish();
+        }
+        let outcome = result?;
         println!(
             "repaired {} chunks in {} ({} component(s))",
             outcome.repaired_chunks,
@@ -1131,7 +1147,22 @@ fn cmd_verify(args: &Args, cfg: &Config) -> Result<()> {
     let components = install::load_installed_components(&dir)?;
     let files = install::load_installed_files(&dir)?;
     let threads = concurrency_from(args, cfg)?.verify_threads();
-    let report = install::verify_files(&dir, &files, threads)?;
+    let interactive = !args.has("no-progress") && std::io::stdout().is_terminal();
+    let ui = Arc::new(std::sync::Mutex::new(ProgressUi::new(interactive)));
+    let callback = {
+        let ui = ui.clone();
+        Arc::new(move |progress: Progress| {
+            if let Ok(mut ui) = ui.lock() {
+                ui.render(&progress);
+            }
+        }) as Arc<dyn Fn(Progress) + Send + Sync>
+    };
+    let result = install::verify_files_with_progress(&dir, &files, threads, Some(callback));
+    if interactive {
+        let mut ui = ui.lock().unwrap();
+        ui.finish();
+    }
+    let report = result?;
     println!("checked {} file(s) in {} component(s)", report.checked, components.len());
     println!("  ok      : {}", report.ok);
     println!("  bad     : {}", report.bad.len());
@@ -1579,28 +1610,63 @@ impl ProgressUi {
             return;
         }
         self.last_render = Instant::now();
-        let fraction = if progress.bytes_total > 0 {
-            (progress.bytes_done as f64 / progress.bytes_total as f64).clamp(0.0, 1.0)
+        let (label, done, total, speed, extra, eta) = match progress.phase {
+            Phase::Download => (
+                "下载",
+                progress.bytes_done,
+                progress.bytes_total,
+                progress.speed_bps,
+                format!(
+                    "inflight {}/{}  retry {}",
+                    progress.inflight, progress.peak_inflight, progress.retries
+                ),
+                progress.eta_secs,
+            ),
+            Phase::Verify => {
+                let verify = &progress.verify;
+                (
+                    "校验",
+                    verify.bytes_done,
+                    verify.bytes_total,
+                    verify.speed_bps,
+                    format!(
+                        "files {}/{}  threads {}",
+                        verify.files_done, verify.files_total, verify.threads
+                    ),
+                    verify.eta_secs,
+                )
+            }
+            Phase::Repair => (
+                "修复",
+                progress.bytes_done,
+                progress.bytes_total,
+                progress.speed_bps,
+                format!(
+                    "inflight {}/{}  retry {}",
+                    progress.inflight, progress.peak_inflight, progress.retries
+                ),
+                progress.eta_secs,
+            ),
+        };
+        let fraction = if total > 0 {
+            (done as f64 / total as f64).clamp(0.0, 1.0)
+        } else if progress.phase == Phase::Verify && progress.verify.files_total > 0 {
+            progress.verify.files_done as f64 / progress.verify.files_total as f64
         } else {
             0.0
         };
         let width = 32usize;
         let filled = (fraction * width as f64).round() as usize;
         let bar: String = "=".repeat(filled) + &" ".repeat(width - filled);
-        let eta = progress
-            .eta_secs
+        let eta = eta
             .map(|s| format!("{}:{:02}", (s as u64) / 60, (s as u64) % 60))
             .unwrap_or_else(|| "--:--".to_string());
         print!(
-            "\r[{bar}] {:5.1}%  {}/{}  {}/s  inflight {}/{}  eta {}  retry {}   ",
+            "\r{label} [{bar}] {:5.1}%  {}/{}  {}/s  {extra}  eta {eta}   ",
             fraction * 100.0,
-            util::human_bytes(progress.bytes_done),
-            util::human_bytes(progress.bytes_total),
-            util::human_bytes(progress.speed_bps as u64),
-            progress.inflight,
-            progress.peak_inflight,
-            eta,
-            progress.retries
+            util::human_bytes(done),
+            util::human_bytes(total),
+            util::human_bytes(speed as u64),
         );
         let _ = std::io::stdout().flush();
     }

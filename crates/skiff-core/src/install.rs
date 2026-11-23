@@ -14,7 +14,9 @@
 
 use crate::api::{Api, BuildInfo, GameEntry};
 use crate::config::Concurrency;
-use crate::download::{self, ChunkJob, ChunkSink, DownloadOptions, Progress, ProgressTracker};
+use crate::download::{
+    self, ChunkJob, ChunkSink, DownloadOptions, Phase, Progress, ProgressTracker, VerifyProgress,
+};
 use crate::error::{Error, Result};
 use crate::http::{Client, Request};
 use crate::manifest::{FileManifest, Manifest};
@@ -24,7 +26,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1231,7 +1233,7 @@ fn install_components_inner(
         &sink,
         tracker,
         cancel.clone(),
-        on_progress,
+        on_progress.clone(),
     )?;
 
     // A cancelled run must not fall through to verification: the files are known-incomplete, and the
@@ -1265,14 +1267,24 @@ fn install_components_inner(
 
     // Verification: cheap enough to always run on the chunks we just wrote.
     let mut report = if unchanged_paths.is_empty() {
-        verify_files(install_dir, &files, opts.concurrency.verify_threads())?
+        verify_files_with_progress(
+            install_dir,
+            &files,
+            opts.concurrency.verify_threads(),
+            on_progress.clone(),
+        )?
     } else {
         let subset: Vec<_> = files
             .iter()
             .filter(|(rel, _)| !unchanged_paths.contains(rel))
             .cloned()
             .collect();
-        verify_files(install_dir, &subset, opts.concurrency.verify_threads())?
+        verify_files_with_progress(
+            install_dir,
+            &subset,
+            opts.concurrency.verify_threads(),
+            on_progress.clone(),
+        )?
     };
     if cancelled(&cancel) {
         return Err(cancelled_error());
@@ -1314,6 +1326,15 @@ fn install_components_inner(
                 install_dir: install_dir.clone(),
                 pending: AtomicUsize::new(0),
             };
+            // The repair pass reuses the download engine; mark its snapshots so a front-end can tell
+            // it apart from the initial download (and from the verification that follows).
+            let repair_progress = on_progress.as_ref().map(|callback| {
+                let callback = callback.clone();
+                Arc::new(move |mut progress: Progress| {
+                    progress.phase = Phase::Repair;
+                    callback(progress);
+                }) as Arc<dyn Fn(Progress) + Send + Sync>
+            });
             let repair_stats = download::download(
                 client,
                 &crate::cdn::CdnHosts::new(bases.clone()),
@@ -1326,10 +1347,15 @@ fn install_components_inner(
                 &redo_sink,
                 tracker,
                 cancel.clone(),
-                None,
+                repair_progress,
             )?;
             stats.chunks_done += repair_stats.chunks_done;
-            report = verify_files(install_dir, &files, opts.concurrency.verify_threads())?;
+            report = verify_files_with_progress(
+                install_dir,
+                &files,
+                opts.concurrency.verify_threads(),
+                on_progress.clone(),
+            )?;
         }
     }
 
@@ -1468,16 +1494,88 @@ pub fn verify_files(
     files: &[(String, FileManifest)],
     threads: usize,
 ) -> Result<VerifyReport> {
+    verify_files_with_progress(install_dir, files, threads, None)
+}
+
+/// Verify every file and report progress while doing it.
+///
+/// A front-end that passes `on_progress` receives [`Phase::Verify`] snapshots every 250 ms (plus one
+/// final snapshot after the pass ends). Counters live in [`VerifyProgress`]: bytes advance as files
+/// are read, so even one huge file produces a moving bar.
+pub fn verify_files_with_progress(
+    install_dir: &Path,
+    files: &[(String, FileManifest)],
+    threads: usize,
+    on_progress: Option<Arc<dyn Fn(Progress) + Send + Sync>>,
+) -> Result<VerifyReport> {
     let threads = threads.max(1);
+    if files.is_empty() {
+        return Ok(VerifyReport::default());
+    }
+
     let counter = AtomicUsize::new(0);
     let report: Mutex<VerifyReport> = Mutex::new(VerifyReport::default());
     let cancel = shared_cancel();
+
+    let total_files = files.len();
+    let total_bytes: u64 = files.iter().map(|(_, meta)| meta.size).sum();
+    let files_done = Arc::new(AtomicUsize::new(0));
+    let bytes_done = Arc::new(AtomicU64::new(0));
+
+    // Progress monitor: samples the counters on a fixed cadence so workers never block on a
+    // front-end callback. The sleep runs in slices so the final frame does not wait out a full tick.
+    let monitor = on_progress.map(|callback| {
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = stop.clone();
+        let files_done = files_done.clone();
+        let bytes_done = bytes_done.clone();
+        let started = Instant::now();
+        let handle = std::thread::spawn(move || {
+            let snapshot = || {
+                let elapsed = started.elapsed().as_secs_f64().max(0.001);
+                let done_files = files_done.load(Ordering::Acquire);
+                let read_bytes = bytes_done.load(Ordering::Acquire).min(total_bytes);
+                // A finished pass is 100% even when a damaged file was shorter than its manifest
+                // entry: the point of the bar is to say "this pass is over".
+                let done_bytes = if done_files >= total_files { total_bytes } else { read_bytes };
+                let speed = done_bytes as f64 / elapsed;
+                let remaining = total_bytes.saturating_sub(done_bytes);
+                Progress {
+                    phase: Phase::Verify,
+                    elapsed_secs: elapsed,
+                    verify: VerifyProgress {
+                        files_total: total_files,
+                        files_done: done_files,
+                        bytes_total: total_bytes,
+                        bytes_done: done_bytes,
+                        speed_bps: speed,
+                        eta_secs: if speed > 1.0 { Some(remaining as f64 / speed) } else { None },
+                        threads,
+                    },
+                    ..Default::default()
+                }
+            };
+            while !stop_thread.load(Ordering::Relaxed) {
+                callback(snapshot());
+                for _ in 0..10 {
+                    std::thread::sleep(Duration::from_millis(25));
+                    if stop_thread.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
+            }
+            callback(snapshot());
+        });
+        (stop, handle)
+    });
 
     std::thread::scope(|scope| {
         for _ in 0..threads {
             let counter = &counter;
             let report = &report;
             let cancel = &cancel;
+            let files_done = &files_done;
+            let bytes_done = &bytes_done;
             scope.spawn(move || loop {
                 if cancelled(cancel) {
                     break;
@@ -1488,7 +1586,9 @@ pub fn verify_files(
                 }
                 let (rel, meta) = &files[index];
                 let path = util::install_path(install_dir, rel);
-                match verify_one(&path, meta, cancel) {
+                let result = verify_one(&path, meta, cancel, bytes_done.as_ref());
+                files_done.fetch_add(1, Ordering::AcqRel);
+                match result {
                     Ok(true) => {
                         let mut guard = report.lock().unwrap();
                         guard.checked += 1;
@@ -1509,10 +1609,20 @@ pub fn verify_files(
         }
     });
 
+    if let Some((stop, handle)) = monitor {
+        stop.store(true, Ordering::Relaxed);
+        let _ = handle.join();
+    }
+
     Ok(report.into_inner().unwrap_or_default())
 }
 
-fn verify_one(path: &Path, meta: &FileManifest, cancel: &Arc<AtomicBool>) -> Result<bool> {
+fn verify_one(
+    path: &Path,
+    meta: &FileManifest,
+    cancel: &Arc<AtomicBool>,
+    bytes_done: &AtomicU64,
+) -> Result<bool> {
     use sha1::{Digest, Sha1};
     let mut file = File::open(path)?;
     let mut hasher = Sha1::new();
@@ -1528,6 +1638,7 @@ fn verify_one(path: &Path, meta: &FileManifest, cancel: &Arc<AtomicBool>) -> Res
             break;
         }
         hasher.update(&buf[..n]);
+        bytes_done.fetch_add(n as u64, Ordering::Relaxed);
         total += n as u64;
     }
     if total != meta.size {
@@ -2213,6 +2324,58 @@ mod tests {
         std::fs::write(dir.join("a.txt"), b"hellx").unwrap();
         let report = verify_files(&dir, &fixed, 2).unwrap();
         assert_eq!(report.bad.len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn verification_reports_phase_progress() {
+        use sha1::{Digest, Sha1};
+
+        let dir = temp_dir("verify-progress");
+        let mut files = Vec::new();
+        let mut total = 0u64;
+        for index in 0..3u8 {
+            let name = format!("f{index}.bin");
+            let data = vec![index + 1; 4096 * (index as usize + 1)];
+            std::fs::write(dir.join(&name), &data).unwrap();
+            let mut hasher = Sha1::new();
+            hasher.update(&data);
+            total += data.len() as u64;
+            files.push((
+                name.clone(),
+                FileManifest {
+                    path: name,
+                    symlink_target: String::new(),
+                    hash: hasher.finalize().into(),
+                    flags: 0,
+                    install_tags: Vec::new(),
+                    parts: Vec::new(),
+                    size: data.len() as u64,
+                    md5: None,
+                    mime_type: String::new(),
+                    sha256: None,
+                },
+            ));
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let seen = seen.clone();
+            Arc::new(move |progress: Progress| seen.lock().unwrap().push(progress))
+                as Arc<dyn Fn(Progress) + Send + Sync>
+        };
+        let report = verify_files_with_progress(&dir, &files, 2, Some(sink)).unwrap();
+        assert!(report.is_clean(), "expected a clean report: {report:?}");
+
+        let events = seen.lock().unwrap();
+        assert!(!events.is_empty(), "verification should report at least one frame");
+        assert!(events.iter().all(|event| event.phase == Phase::Verify));
+        let last = events.last().unwrap();
+        assert_eq!(last.verify.files_total, 3);
+        assert_eq!(last.verify.files_done, 3);
+        assert_eq!(last.verify.bytes_total, total);
+        assert_eq!(last.verify.bytes_done, total);
+        assert_eq!(last.verify.threads, 2);
         std::fs::remove_dir_all(&dir).ok();
     }
 

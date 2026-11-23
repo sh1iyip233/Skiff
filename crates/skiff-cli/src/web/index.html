@@ -109,11 +109,11 @@
       <div class="bar"><i id="bar"></i></div>
       <div class="stats" id="stats">
         <div><span>状态</span> <b id="s-state">空闲</b></div>
-        <div><span>速度</span> <b id="s-speed">—</b></div>
-        <div><span>已下载</span> <b id="s-bytes">—</b></div>
+        <div><span id="l-speed">速度</span> <b id="s-speed">—</b></div>
+        <div><span id="l-bytes">已下载</span> <b id="s-bytes">—</b></div>
         <div><span>预计剩余</span> <b id="s-eta">—</b></div>
-        <div><span>分块</span> <b id="s-chunks">—</b></div>
-        <div><span>在途 / 峰值</span> <b id="s-inflight">—</b></div>
+        <div><span id="l-chunks">分块</span> <b id="s-chunks">—</b></div>
+        <div><span id="l-inflight">在途 / 峰值</span> <b id="s-inflight">—</b></div>
       </div>
       <div class="hint" id="job-note"></div>
     </section>
@@ -263,14 +263,39 @@ async function refreshState() {
 
 function applyJob(job) {
   if (!job) return;
-  const pct = job.bytes_total ? Math.min(100, job.bytes_done / job.bytes_total * 100) : 0;
+  const phase = job.phase || "download";
+  const verifying = phase === "verify";
+  const repairing = phase === "repair";
+  const active = verifying
+    ? {
+        bytesDone: job.verify_bytes_done, bytesTotal: job.verify_bytes_total,
+        speed: job.verify_speed_bps, eta: job.verify_eta_secs,
+        done: job.verify_files_done, total: job.verify_files_total,
+      }
+    : {
+        bytesDone: job.bytes_done, bytesTotal: job.bytes_total,
+        speed: job.speed_bps, eta: job.eta_secs,
+        done: job.chunks_done, total: job.chunks_total,
+      };
+  let pct = active.bytesTotal
+    ? Math.min(100, active.bytesDone / active.bytesTotal * 100)
+    : (verifying && active.total ? Math.min(100, active.done / active.total * 100) : 0);
   $("bar").style.width = pct.toFixed(1) + "%";
-  $("s-state").textContent = job.running ? "下载中" : (job.finished ? (job.error ? "失败" : "完成") : "空闲");
-  $("s-speed").textContent = job.running ? humanBytes(job.speed_bps) + "/s" : "—";
-  $("s-bytes").textContent = `${humanBytes(job.bytes_done)} / ${humanBytes(job.bytes_total)}`;
-  $("s-eta").textContent = job.eta_secs ? `${Math.round(job.eta_secs)} 秒` : "—";
-  $("s-chunks").textContent = `${job.chunks_done} / ${job.chunks_total}`;
-  $("s-inflight").textContent = `${job.inflight} / ${job.peak_inflight}`;
+  const runningLabel = verifying ? "校验中" : repairing ? "修复中" : "下载中";
+  $("s-state").textContent = job.running
+    ? runningLabel
+    : (job.finished ? (job.error ? "失败" : "完成") : "空闲");
+  $("s-speed").textContent = job.running ? humanBytes(active.speed) + "/s" : "—";
+  $("s-bytes").textContent = `${humanBytes(active.bytesDone)} / ${humanBytes(active.bytesTotal)}`;
+  $("s-eta").textContent = active.eta ? `${Math.round(active.eta)} 秒` : "—";
+  $("s-chunks").textContent = `${active.done} / ${active.total}`;
+  $("s-inflight").textContent = verifying
+    ? `${job.verify_threads} 线程`
+    : `${job.inflight} / ${job.peak_inflight}`;
+  $("l-speed").textContent = verifying ? "校验速度" : repairing ? "修复速度" : "速度";
+  $("l-bytes").textContent = verifying ? "已校验" : repairing ? "已修复" : "已下载";
+  $("l-chunks").textContent = verifying ? "文件" : "分块";
+  $("l-inflight").textContent = verifying ? "校验线程" : "在途 / 峰值";
   $("btn-cancel").disabled = !job.running;
   $("btn-install").disabled = job.running || !selected;
   if (job.error) { $("job-note").className = "hint err"; $("job-note").textContent = job.error; }
