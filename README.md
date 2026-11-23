@@ -20,6 +20,7 @@
 - **多线程分块下载**：自己定下载并发数，支持多 CDN 节点轮转、连接复用和自动剔除连不上的节点（比如国内经常超时的 Akamai 节点）。
 - **校验与续传**：支持断点续传、逐块 SHA-1 / rolling hash 校验、zlib 解包，文件坏了可以用 `--repair` 只重下损坏的分块。
 - **兼容官方启动器**：自动写出 `.egstore`（`.item` / `.mancpn` / `.manifest`），也可以选择注册到官方启动器（注册后需要把启动器从托盘完全退出再打开才生效，见下文）。
+- **启动游戏并传递 Epic 账号**：`skiff launch`（桌面端详情里的「启动游戏」）会像官方启动器一样生成一次性 exchange code，让游戏内直接拿到当前 Epic 账号，不用在游戏里再登录一次。
 
 ## 快速上手
 
@@ -118,6 +119,37 @@ skiff uninstall "D:\Games\Cyberpunk2077" --keep-files
 
 `--keep-files`（桌面端即取消勾选「同时删除游戏文件」）只移除 `.egstore` 安装记录和官方启动器记录，游戏文件原样保留。此后 Skiff 和官方启动器都不再把它当作已安装；想恢复需要重新安装。
 
+## 在游戏里直接登录 Epic 账号（启动游戏）
+
+有些 Epic 游戏（比如 Cyberpunk 2077）启动后还要在游戏里登录 Epic 账号才能玩。官方启动器并不是把密码交给游戏，而是在启动时把一个一次性的 **exchange code** 放进命令行；游戏（或它自己的发行商启动器）拿这个 code 去 Epic 的 EOS 服务换自己的登录态，所以看起来就是「已经登录」。Skiff 现在也走同一套流程：
+
+```powershell
+skiff launch "Cyberpunk 2077"                         # 启动并自动带上当前账号
+skiff launch "Cyberpunk 2077" --dry-run               # 只看要执行的命令行（code 打码），不发请求
+skiff launch "Cyberpunk 2077" --no-auth               # 不带账号启动，游戏自己决定要不要登录
+skiff launch "Cyberpunk 2077" --deployment-id <id>    # 个别游戏需要显式 EOS deployment id
+skiff launch "Cyberpunk 2077" -- -windowed            # `--` 之后的参数原样交给游戏
+```
+
+桌面端：在游戏库里打开已安装游戏的详情，底部会多出「启动游戏」。
+
+传的参数和官方启动器一致（顺序也一样）：
+
+```text
+-AUTH_LOGIN=unused -AUTH_PASSWORD=<一次性 code> -AUTH_TYPE=exchangecode
+-epicapp=<AppName> -epicenv=Prod [-epicdeploymentid=<id>] -EpicPortal
+[-epicusername="<账号显示名>"] -epicuserid=<账号 id> -epiclocale=<语言>
+[-epicsandboxid=<namespace>]
+```
+
+几点说明：
+
+- 启动的可执行文件取 `.egstore` 里官方启动器记录的那个入口（`LaunchExecutable`），所以像 Cyberpunk 会先起 `redprelauncher.exe`，再由它把账号交给游戏本体。
+- code 只活约 5 分钟、只能用一次。Skiff 会先校验安装，最后才取 code，取完立刻启动；code 不写日志、不进 `--json`，`--dry-run` 里也只显示 `********`。
+- `--no-auth` 适合离线或不需要 Epic 账号的游戏；这条路径不会向 Epic 发任何请求。
+- 带反作弊的游戏（Fortnite、Fall Guys、Rocket League 等）仍可能要求官方启动器；这是游戏侧的限制，Skiff 不做绕过。
+- 如果某个游戏在游戏内仍然提示登录，先确认它启动的是 `.egstore` 里登记的入口；再试 `--deployment-id`（值可以从官方启动器日志里的 `-epicdeploymentid=` 抄到）。
+
 ## 并发与限速
 
 下载线程数完全按你设定的来，程序不会偷偷帮你调高或调低。填超范围会直接报错（退出码 2），安装完后会打印实际峰值并发 `peak inflight` 供核对。
@@ -156,6 +188,8 @@ skiff dlc add <appName> [<dlcName>...] [--dry-run] [-j N] [--write-threads N] [-
                         [--limit-rate 50M] [--dir <path>] [--register-launcher] [-y]
 skiff verify <installDir> [--repair]
 skiff uninstall <installDir> [--keep-files]
+skiff launch <appName> [--dir <path>] [--no-auth] [--dry-run]
+                      [--deployment-id <id>] [--locale <locale>] [-- <game args>...]
 skiff register <installDir>
 skiff config get | set <key> <value> | list
 skiff debug manifest <file> [--json]
@@ -261,7 +295,7 @@ cargo +stable-x86_64-pc-windows-gnu test -p skiff-core --offline
 2. **还不支持增量更新**：目前每次 `install` 都是全量校验/下载，还没利用 `.mancpn` 做差异更新。
 3. **部分游戏名显示为内部代号**：比如 `Cyberpunk 2077` 在目录里可能只拿到代号 `Ginger`，个别条目会显示无商店信息，后续需要补查询逻辑。
 4. **注册到官方启动器需要管理员权限**：因为要写 `%ProgramData%`。没权限时注册会失败，但不会让整次安装失败，游戏文件照常保留（只是官方启动器里看不到）。注册用的 EOSH 记录格式是未公开的，启动器大版本更新后可能需要用 `skiff register` 重新注册。
-5. **反作弊 / EOS 依赖**：本工具只管下载安装，有些游戏不开官方启动器还是进不去。
+5. **反作弊 / EOS 依赖**：`skiff launch` 已经能把 Epic 账号传给游戏，但带反作弊的游戏（Fortnite、Fall Guys 等）仍可能要求官方启动器；这是游戏侧的限制。
 6. **只测了 Windows**：Linux/macOS 能编译，但没接 HTTPS 后端，目前没法直接下 Epic 的东西。
 7. **只买了 DLC 没买本体**：`library list --all` 能看到，但无法单独安装（补装到已装好的本体上是支持的，见 `skiff dlc add`）。
 8. **中途强退的进度损耗**：续传记录每 64 个分块刷一次盘，按 `Ctrl-C` 最多重下不到 64 MiB。

@@ -9,6 +9,7 @@ use skiff_core::download::{Phase, Progress};
 use skiff_core::error::{Error, Result};
 use skiff_core::http::Client;
 use skiff_core::install::{self, InstallOptions};
+use skiff_core::launch;
 use skiff_core::library;
 use skiff_core::manifest::Manifest;
 use skiff_core::{auth, util};
@@ -36,6 +37,8 @@ USAGE:
                           [--dry-run] [-y]
   skiff verify <installDir> [--repair]
   skiff uninstall <installDir> [--keep-files]
+  skiff launch <appName> [--dir <path>] [--no-auth] [--dry-run]
+                        [--deployment-id <id>] [--locale <locale>] [-- <game args>...]
   skiff register <installDir>
   skiff config get | set <key> <value> | list
   skiff debug manifest <file> [--json]
@@ -89,7 +92,7 @@ impl Args {
                     rest,
                     "json" | "no-progress" | "verify" | "repair" | "register-launcher" | "keep-files"
                         | "device-code" | "yes" | "verbose" | "auto-concurrency"
-                        | "refresh" | "all" | "no-dlc" | "dir-is-exact" | "dry-run"
+                        | "refresh" | "all" | "no-dlc" | "dir-is-exact" | "dry-run" | "no-auth"
                 ) || rest == "y"
                 {
                     args.switches.insert(rest.to_string());
@@ -165,6 +168,7 @@ fn run() -> Result<()> {
         Some("dlc") => cmd_dlc(&args, &cfg, json),
         Some("verify") => cmd_verify(&args, &cfg),
         Some("uninstall") => cmd_uninstall(&args, &cfg),
+        Some("launch") => cmd_launch(&args, &cfg, json),
         Some("register") => cmd_register(&args),
         Some("config") => cmd_config(&args, &cfg),
         Some("debug") => cmd_debug(&args, &cfg, json),
@@ -1242,6 +1246,117 @@ fn cmd_uninstall(args: &Args, cfg: &Config) -> Result<()> {
             "could not remove {}",
             dir.join(".egstore").display()
         )));
+    }
+    Ok(())
+}
+
+/// Start an installed game with the same Epic account hand-off the official launcher uses.
+///
+/// `--dry-run` resolves the install and prints the exact command line without contacting Epic; the
+/// exchange code is always masked. `--no-auth` starts the game without any `-AUTH_*` argument, which
+/// is useful offline or for titles that do not use Epic accounts.
+fn cmd_launch(args: &Args, cfg: &Config, json: bool) -> Result<()> {
+    let key = args.required(1, "app name")?;
+    let no_auth = args.has("no-auth");
+    let dry_run = args.has("dry-run");
+    let client = client();
+    let tokens = if no_auth { None } else { Some(require_tokens(cfg, &client)?) };
+
+    let mut games = install::load_cached_games().unwrap_or_default();
+    if games.is_empty() {
+        let Some(tokens) = tokens.as_ref() else {
+            return Err(Error::usage(
+                "the game library cache is empty; run `skiff library list --refresh` first (or drop --no-auth)",
+            ));
+        };
+        let api = api(&client, cfg, tokens);
+        games = load_games(&api, tokens)?;
+    }
+    let choice = select_bundle(&games, key)?;
+    if choice.orphan || choice.base.is_dlc {
+        return Err(Error::usage(format!(
+            "'{}' is an add-on without a main game in this library",
+            choice.selected.title
+        )));
+    }
+    let game = choice.base;
+    let dir = resolve_install_dir(args, cfg, &game);
+    if !dir.join(".egstore").is_dir() {
+        return Err(Error::integrity(format!(
+            "{} is not installed under {}; run `skiff install \"{}\"` first",
+            game.title,
+            dir.display(),
+            game.title
+        )));
+    }
+
+    // Everything after the app name is handed to the game unchanged (`--` is the safe spelling).
+    let extra_args: Vec<String> = args.positional.iter().skip(2).cloned().collect();
+    let opts = launch::LaunchOptions {
+        install_dir: Some(dir.clone()),
+        extra_args,
+        auth: !no_auth,
+        deployment_id: args.flag("deployment-id").map(str::to_string),
+        locale: args.flag("locale").map(str::to_string),
+        dry_run,
+    };
+    let plan = launch::plan(cfg, &client, tokens.as_ref(), &dir, &game.title, &opts)?;
+
+    if dry_run {
+        if json {
+            let report = serde_json::json!({
+                "app_name": plan.target().app_name,
+                "title": game.title,
+                "install_dir": dir.to_string_lossy(),
+                "executable": plan.target().executable.to_string_lossy(),
+                "authenticated": plan.authenticated(),
+                "exchange_expires_in": plan.exchange_expires_in(),
+                "args": plan.masked_args(),
+                "command_line": plan.display_command_line(),
+            });
+            let text = serde_json::to_string_pretty(&report)
+                .map_err(|e| Error::integrity(format!("cannot serialize launch plan: {e}")))?;
+            println!("{text}");
+        } else {
+            println!("game       : {}", game.title);
+            println!("app        : {}", plan.target().app_name);
+            println!("install    : {}", dir.display());
+            println!("executable : {}", plan.target().executable.display());
+            println!(
+                "auth       : {}",
+                if plan.authenticated() {
+                    "exchange code (masked)"
+                } else {
+                    "disabled (--no-auth)"
+                }
+            );
+            println!("command    : {}", plan.display_command_line());
+        }
+        return Ok(());
+    }
+
+    // The exchange code lives for about five minutes, so spawn right after minting it.
+    let pid = launch::spawn(&plan)?;
+    if json {
+        let report = serde_json::json!({
+            "app_name": plan.target().app_name,
+            "title": game.title,
+            "install_dir": dir.to_string_lossy(),
+            "executable": plan.target().executable.to_string_lossy(),
+            "authenticated": plan.authenticated(),
+            "pid": pid,
+        });
+        let text = serde_json::to_string_pretty(&report)
+            .map_err(|e| Error::integrity(format!("cannot serialize launch report: {e}")))?;
+        println!("{text}");
+    } else {
+        println!("started {} (pid {pid})", game.title);
+        if plan.authenticated() {
+            println!(
+                "  account : Epic account handed to the game (exchange code expires in {}s)",
+                plan.exchange_expires_in()
+            );
+        }
     }
     Ok(())
 }

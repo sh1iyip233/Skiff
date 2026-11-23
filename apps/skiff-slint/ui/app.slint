@@ -1304,6 +1304,8 @@ export component AppWindow inherits Window {
     in property <string> detail-error: "";
     in property <string> detail-notice: "";
     in property <int> detail-notice-tone: 1;
+    // A launch worker is minting the exchange code and starting the game.
+    in property <bool> launch-busy: false;
 
     // ---- uninstall confirmation ------------------------------------------
     in-out property <bool> uninstall-open: false;
@@ -1350,6 +1352,7 @@ export component AppWindow inherits Window {
     callback request-uninstall();
     callback confirm-uninstall();
     callback cancel-uninstall();
+    callback launch-game();
     callback retry-space();
     callback save-settings();
     callback finish-setup();
@@ -2518,12 +2521,20 @@ export component AppWindow inherits Window {
                         if !root.job-running : HorizontalLayout {
                             spacing: 8px;
 
+                            if root.selected-install-status == 1 : AppButton {
+                                label: root.launch-busy ? "正在启动…" : "启动游戏";
+                                primary: true;
+                                horizontal-stretch: 1;
+                                enabled: !root.launch-busy;
+                                clicked => { root.launch-game(); }
+                            }
+
                             AppButton {
                                 label: root.space-pending ? "正在检查空间…"
                                     : root.selected-install-status == 2 || root.can-resume ? "继续安装"
                                     : root.selected-install-status == 1 ? "校验并更新"
                                     : "开始安装";
-                                primary: true;
+                                primary: root.selected-install-status != 1;
                                 horizontal-stretch: 1;
                                 enabled: root.install-enabled;
                                 clicked => { root.install(); }

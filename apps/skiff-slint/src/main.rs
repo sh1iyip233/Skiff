@@ -20,6 +20,7 @@ use skiff_core::disk;
 use skiff_core::download::{Phase, Progress};
 use skiff_core::http::Client;
 use skiff_core::install::{self, InstallOptions};
+use skiff_core::launch;
 use skiff_core::library::{self, GameGroup};
 use slint::{Color, ComponentHandle, ModelRc, SharedString, VecModel};
 use std::collections::HashMap;
@@ -558,6 +559,8 @@ struct Snapshot {
     detail_notice: String,
     /// `NoticeBanner` tone for `detail_notice` (1 = ok, 2 = warn).
     detail_notice_tone: i32,
+    /// A launch worker is running (mint + spawn), used to debounce and to label the button.
+    launch_busy: bool,
     /// Uninstall confirmation dialog state.
     uninstall_open: bool,
     uninstall_busy: bool,
@@ -2230,6 +2233,77 @@ fn main() -> Result<(), slint::PlatformError> {
             });
         });
     }
+    // ---- launch game -------------------------------------------------------------------
+    {
+        let state = state.clone();
+        ui.on_launch_game(move || {
+            let busy = state.snapshot.lock().map(|snapshot| snapshot.launch_busy).unwrap_or(false);
+            if busy {
+                return;
+            }
+            if state.snapshot.lock().map(|snapshot| snapshot.running).unwrap_or(false) {
+                edit(&state, |snapshot| {
+                    snapshot.detail_error = "有下载任务正在运行，请先完成或暂停。".to_string();
+                    snapshot.detail_notice.clear();
+                });
+                return;
+            }
+            let Some((_app, dir, status, title)) = selected_install_target(&state) else {
+                edit(&state, |snapshot| {
+                    snapshot.detail_error = "没有找到本地安装目录，请关闭后重试。".to_string();
+                    snapshot.detail_notice.clear();
+                });
+                return;
+            };
+            if status != InstallStatus::Installed {
+                edit(&state, |snapshot| {
+                    snapshot.detail_error = "没有检测到已安装的游戏文件。".to_string();
+                    snapshot.detail_notice.clear();
+                });
+                return;
+            }
+            edit(&state, |snapshot| {
+                snapshot.launch_busy = true;
+                snapshot.detail_error.clear();
+                snapshot.detail_notice.clear();
+            });
+
+            let worker = state.clone();
+            std::thread::spawn(move || {
+                let result = (|| -> skiff_core::Result<u32> {
+                    let cfg = Config::load()?;
+                    let client = Client::new();
+                    let tokens = auth::load_tokens()?.ok_or_else(|| {
+                        skiff_core::Error::Auth(
+                            "not logged in; log in before launching a game".into(),
+                        )
+                    })?;
+                    let tokens = auth::ensure_fresh(&cfg, &client, tokens)?;
+                    let opts = launch::LaunchOptions {
+                        install_dir: Some(dir.clone()),
+                        auth: true,
+                        ..launch::LaunchOptions::default()
+                    };
+                    let plan = launch::plan(&cfg, &client, Some(&tokens), &dir, &title, &opts)?;
+                    launch::spawn(&plan)
+                })();
+                match result {
+                    Ok(pid) => edit(&worker, |snapshot| {
+                        snapshot.launch_busy = false;
+                        snapshot.detail_error.clear();
+                        snapshot.detail_notice =
+                            format!("已启动「{title}」，Epic 账号信息已传给游戏（pid {pid}）");
+                        snapshot.detail_notice_tone = 1;
+                    }),
+                    Err(err) => edit(&worker, |snapshot| {
+                        snapshot.launch_busy = false;
+                        snapshot.detail_notice.clear();
+                        snapshot.detail_error = format!("启动失败：{err}");
+                    }),
+                }
+            });
+        });
+    }
     {
         let ui_weak = ui.as_weak();
         let state = state.clone();
@@ -2534,6 +2608,7 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_uninstall_open(snapshot.uninstall_open);
             ui.set_uninstall_busy(snapshot.uninstall_busy);
             ui.set_uninstall_error(SharedString::from(snapshot.uninstall_error.clone()));
+            ui.set_launch_busy(snapshot.launch_busy);
 
             // ---- pre-download space gate ----
             // Only the open drawer pays for the estimate; the volume reading is refreshed in the

@@ -12,6 +12,7 @@ use skiff_core::download::{
 };
 use skiff_core::http::Client;
 use skiff_core::install::{self, InstallComponent, InstallOptions};
+use skiff_core::launch;
 use skiff_core::manifest::{ChunkInfo, ChunkPart, FileManifest, Manifest, ManifestMeta};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -387,6 +388,53 @@ fn installs_files_and_writes_egstore() {
     let files = install::installed_files(&parsed);
     let report = install::verify_files(&dir, &files, 2).unwrap();
     assert!(report.is_clean(), "report: {report:?}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The `.item` written by an install is enough to build a launch command: same executable, app name
+/// and namespace the official launcher would pass to the game.
+#[test]
+fn launch_target_reads_the_written_item() {
+    let (_, raw, containers, _) = fixtures();
+    let parsed = Manifest::parse(&raw).unwrap();
+    let cdn = MockCdn::start(containers);
+    let dir = temp_dir("launch");
+    let opts = options(&dir, CHUNK_COUNT);
+    install::install_manifest(
+        &Client::plain(),
+        &build_info(&cdn.base),
+        &game(),
+        &parsed,
+        &raw,
+        &opts,
+        None,
+    )
+    .expect("install should succeed");
+
+    let target = launch::resolve_target(&dir, "E2E Game", None).expect("launch target");
+    assert_eq!(target.app_name, "E2EGame");
+    assert_eq!(target.display_name, "E2E Game");
+    assert_eq!(target.executable, dir.join("a.bin"));
+    assert_eq!(target.launch_command, "-epicapp=E2EGame");
+    assert_eq!(target.namespace, "e2e");
+    assert!(target.deployment_id.is_empty());
+
+    let tokens = skiff_core::auth::TokenSet {
+        account_id: "acc".into(),
+        display_name: "Tester".into(),
+        access_token: "token".into(),
+        refresh_token: None,
+        token_type: "bearer".into(),
+        client_id: "client".into(),
+        expires_at: 0,
+        refresh_expires_at: 0,
+        scope: String::new(),
+    };
+    let args = launch::build_auth_args(&target, Some(&tokens), Some("0123456789abcdef0123456789abcdef"), "en-US");
+    assert_eq!(args.first().map(String::as_str), Some("-AUTH_LOGIN=unused"));
+    assert!(args.iter().any(|arg| arg == "-epicapp=E2EGame"));
+    assert!(args.iter().any(|arg| arg == "-epicsandboxid=e2e"));
 
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -12,6 +12,7 @@
 //! * [`disk`]   – free-space queries for an install target volume.
 //! * [`download`] – user-bounded thread pool, writer fan-out, rate limiting, progress.
 //! * [`install`] – install/verify/repair orchestration plus `.egstore` metadata writing.
+//! * [`launch`]  – starting an installed game with the official launcher's Epic account hand-off.
 //! * [`launcher`] – registering an install with the official Epic Games Launcher.
 
 pub mod api;
@@ -24,6 +25,7 @@ pub mod download;
 pub mod error;
 pub mod http;
 pub mod install;
+pub mod launch;
 pub mod launcher;
 pub mod library;
 pub mod manifest;
