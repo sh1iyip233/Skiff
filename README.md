@@ -140,6 +140,7 @@ skiff dlc add <appName> [<dlcName>...] [--dry-run] [-j N] [--write-threads N] [-
                         [--limit-rate 50M] [--dir <path>] [--register-launcher] [-y]
 skiff verify <installDir> [--repair]
 skiff uninstall <installDir> [--keep-files]
+skiff register <installDir>
 skiff config get | set <key> <value> | list
 skiff serve [--port <n>] [--open]
 skiff debug manifest <file> [--json]
@@ -173,14 +174,35 @@ skiff debug cdn-probe <appName>
 └── ...游戏文件...
 ```
 
-删掉 `.egstore` 后官方启动器就认不出这个游戏了；用 `skiff uninstall` 卸载时会一并清理 `.egstore` 和 `%ProgramData%\Epic\EpicGamesLauncher\Data\Manifests\` 里对应的 `.item`。
+删掉 `.egstore` 后官方启动器就认不出这个游戏了；用 `skiff uninstall` 卸载时会一并清理 `.egstore`、`%ProgramData%\Epic\EpicGamesLauncher\Data\Manifests\` 里对应的 `.item`，以及 EOS Install Helper 的安装记录（见下）。
 
-**注册到官方启动器后为什么要重启启动器**：官方启动器只在**启动时**扫描 `%ProgramData%\Epic\EpicGamesLauncher\Data\Manifests\*.item`（日志里的 `LoadItemFiles`），运行中不会重新读取。所以如果安装时启动器正开着，游戏不会立刻出现：
+**注册到官方启动器到底写了什么**：从启动器 20.x（2026 年 11 月）开始，安装状态由 EOS Install Helper（EOSH）管理，只往 `%ProgramData%\Epic\EpicGamesLauncher\Data\Manifests\` 放 `.item` **已经不够了**——启动器每次启动都会执行一次对账：
+
+```text
+EOSH reconciliation: removing installation not reported by EOSH '.../<GUID>.item'
+```
+
+清单会被当成过期数据删掉，库里就一直是「安装 / 继续下载」。所以 skiff 现在同时写两处：
+
+```text
+%ProgramData%\Epic\EpicGamesLauncher\Data\Manifests\<GUID>.item
+%ProgramData%\Epic\EpicOnlineServicesShared\InstallHelper\InstalledItems\<GUID>.egi
+%ProgramData%\Epic\EpicOnlineServicesShared\InstallHelper\InstalledItems\Revision.json
+```
+
+`.egi` 是 EOSH 的安装记录（`state: "Installed"`），`Revision.json` 是整份记录的版本号，两处要保持同一个 revision，启动器才会认。具体格式是照启动器自己写出来的记录反推的，属于未公开格式，**Epic 改版后可能失效**；真失效了再更新适配。
+
+**注册后为什么要重启启动器**：启动器只在**启动时**读这两处（日志里的 `LoadItemFiles` 和 EOSH 对账），运行中不会重新读取。所以如果安装时启动器正开着，游戏不会立刻出现：
 
 1. 右键任务栏通知区域里的 Epic 图标 → **退出**（只点窗口右上角的 × 只是最小化到托盘，进程还在，等于没重启）；
 2. 重新打开 Epic 启动器，游戏就会显示为「已安装」，可以直接开始游戏。
 
-新版本启动器（20.x）把安装状态交给 EOS Install Helper 管理，首次启动时会把已有的 `.item` 迁移进去；迁移之后再补 `.item`，同样要重启启动器才会被收进去。skiff 在命令行和桌面端都会在安装完成后提示这一点。
+如果清单被启动器清掉了（比如启动器大版本更新之后），不用重装，直接补注册即可：
+
+```powershell
+skiff register "D:\Games\Cyberpunk2077"
+```
+
 
 **关于暂停和取消**：
 - **暂停**（命令行按 `Ctrl-C` 也是这个效果）：停掉下载，保留已经下好的文件和续传记录，下次接着下。
@@ -219,7 +241,7 @@ cargo +stable-x86_64-pc-windows-gnu test -p skiff-core --offline
 1. **不支持加密 manifest / 加密 chunk（feature level ≥ 22）**：遇到会直接报错提示改用官方启动器。
 2. **还不支持增量更新**：目前每次 `install` 都是全量校验/下载，还没利用 `.mancpn` 做差异更新。
 3. **部分游戏名显示为内部代号**：比如 `Cyberpunk 2077` 在目录里可能只拿到代号 `Ginger`，个别条目会显示无商店信息，后续需要补查询逻辑。
-4. **注册到官方启动器需要管理员权限**：因为要写 `%ProgramData%`。没权限时注册会失败，但不会让整次安装失败，游戏文件照常保留（只是官方启动器里看不到）。
+4. **注册到官方启动器需要管理员权限**：因为要写 `%ProgramData%`。没权限时注册会失败，但不会让整次安装失败，游戏文件照常保留（只是官方启动器里看不到）。注册用的 EOSH 记录格式是未公开的，启动器大版本更新后可能需要用 `skiff register` 重新注册。
 5. **反作弊 / EOS 依赖**：本工具只管下载安装，有些游戏不开官方启动器还是进不去。
 6. **只测了 Windows**：Linux/macOS 能编译，但没接 HTTPS 后端，目前没法直接下 Epic 的东西。
 7. **只买了 DLC 没买本体**：`library list --all` 能看到，但无法单独安装（补装到已装好的本体上是支持的，见 `skiff dlc add`）。
