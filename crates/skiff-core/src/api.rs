@@ -62,6 +62,8 @@ pub struct CatalogItem {
     pub main_game_app_names: Vec<String>,
     /// App names advertised by this item's own `releaseInfo`.
     pub release_app_names: Vec<String>,
+    /// Best portrait/box key image URL from `keyImages`; empty when the item has none.
+    pub cover_url: String,
 }
 
 /// A game the account can install, merged from the three services.
@@ -83,6 +85,12 @@ pub struct GameEntry {
     /// Catalog categories, copied so `.egstore` can describe an add-on without another lookup.
     #[serde(default)]
     pub categories: Vec<String>,
+    /// Public key image URL for the library cover; empty when the catalog has no usable image.
+    ///
+    /// Old `games.json` files do not have this field, so it defaults to empty and the GUI asks for a
+    /// refresh once instead of invalidating the whole cache.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub cover_url: String,
 }
 
 /// One entry of the launcher's entitled-build list.
@@ -311,17 +319,20 @@ impl<'a> Api<'a> {
         Ok(out)
     }
 
-    /// Resolve remaining codename-style titles through the public egdata.app catalogue.
+    /// Resolve codename-style titles and missing covers through the public egdata.app catalogue.
     ///
     /// Epic exposes no namespace->title mapping to third parties, but egdata indexes the same catalog
-    /// item ids, so a per-item lookup recovers the store title. Best effort by design: any failure
-    /// keeps the codename and never fails the listing, and resolved names are persisted so later runs
-    /// need no network at all.
-    fn enrich_titles_from_egdata(&self, games: &mut [GameEntry]) {
+    /// item ids, so a per-item lookup recovers the store title and key images. Best effort by design:
+    /// any failure keeps the codename / placeholder and never fails the listing, and resolved names
+    /// are persisted so later runs need no network at all.
+    fn enrich_from_egdata(&self, games: &mut [GameEntry]) {
         let pending: Vec<(usize, String, String)> = games
             .iter()
             .enumerate()
-            .filter(|(_, game)| game.title == game.app_name && !game.catalog_item_id.is_empty())
+            .filter(|(_, game)| {
+                (game.title == game.app_name || game.cover_url.is_empty())
+                    && !game.catalog_item_id.is_empty()
+            })
             .map(|(index, game)| (index, game.app_name.clone(), game.catalog_item_id.clone()))
             .take(80)
             .collect();
@@ -332,7 +343,7 @@ impl<'a> Api<'a> {
         // Eight workers: each lookup is one small HTTPS request, and doing them serially dominated
         // `library list` wall time once most titles needed resolving.
         let cursor = AtomicUsize::new(0);
-        let found: Mutex<Vec<(usize, String, String)>> = Mutex::new(Vec::new());
+        let found: Mutex<Vec<(usize, String, String, String)>> = Mutex::new(Vec::new());
         let workers = pending.len().min(8);
         std::thread::scope(|scope| {
             for _ in 0..workers {
@@ -350,20 +361,35 @@ impl<'a> Api<'a> {
                         continue;
                     };
                     let title = value.get("title").and_then(|v| v.as_str()).unwrap_or("");
-                    if title.is_empty() || looks_like_guid(title) || title == app_name {
+                    let title_ok =
+                        !title.is_empty() && !looks_like_guid(title) && title != app_name;
+                    let cover = pick_key_image(&value);
+                    if !title_ok && cover.is_empty() {
                         continue;
                     }
                     if let Ok(mut guard) = found.lock() {
-                        guard.push((*slot, app_name.clone(), title.to_string()));
+                        guard.push((
+                            *slot,
+                            app_name.clone(),
+                            if title_ok { title.to_string() } else { String::new() },
+                            cover,
+                        ));
                     }
                 });
             }
         });
 
         let mut resolved: BTreeMap<String, String> = BTreeMap::new();
-        for (slot, app_name, title) in found.into_inner().unwrap_or_default() {
-            games[slot].title = title.clone();
-            resolved.insert(app_name.to_lowercase(), title);
+        let mut covers = 0usize;
+        for (slot, app_name, title, cover) in found.into_inner().unwrap_or_default() {
+            if games[slot].title == games[slot].app_name && !title.is_empty() {
+                games[slot].title = title.clone();
+                resolved.insert(app_name.to_lowercase(), title);
+            }
+            if games[slot].cover_url.is_empty() && !cover.is_empty() {
+                games[slot].cover_url = cover;
+                covers += 1;
+            }
         }
         if !resolved.is_empty() {
             eprintln!(
@@ -371,6 +397,9 @@ impl<'a> Api<'a> {
                 resolved.len()
             );
             save_title_overrides(resolved);
+        }
+        if covers > 0 {
+            eprintln!("note: resolved {covers} cover image(s) via egdata.app");
         }
     }
 
@@ -406,6 +435,7 @@ impl<'a> Api<'a> {
                     .unwrap_or_else(|| item.app_name.clone()),
                 developer: meta.map(|m| m.developer.clone()).unwrap_or_default(),
                 folder_name: meta.map(|m| m.folder_name.clone()).unwrap_or_default(),
+                cover_url: meta.map(|m| m.cover_url.clone()).unwrap_or_default(),
                 entitlement_type: "EXECUTABLE".to_string(),
                 ..Default::default()
             });
@@ -418,7 +448,7 @@ impl<'a> Api<'a> {
                 }
             }
         }
-        self.enrich_titles_from_egdata(&mut games);
+        self.enrich_from_egdata(&mut games);
         apply_relations(&mut games, &catalog);
         games.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()));
         Ok(games)
@@ -525,6 +555,7 @@ impl<'a> Api<'a> {
                 title,
                 developer: meta.developer,
                 folder_name: meta.folder_name,
+                cover_url: meta.cover_url,
                 entitlement_type: ent.entitlement_type.clone(),
                 ..Default::default()
             });
@@ -565,7 +596,7 @@ impl<'a> Api<'a> {
         // but get a readable placeholder instead of a bare GUID.
         // Resolve codenames before parent matching: `mainGameItem.title` is compared against the
         // final store title, so title resolution has to happen before the unnamed placeholder.
-        self.enrich_titles_from_egdata(&mut games);
+        self.enrich_from_egdata(&mut games);
         let overrides = load_title_overrides();
         if !overrides.is_empty() {
             let mut applied = 0;
@@ -685,6 +716,9 @@ impl<'a> Api<'a> {
                 if !item.folder_name.is_empty() {
                     game.folder_name = item.folder_name.clone();
                 }
+                if !item.cover_url.is_empty() {
+                    game.cover_url = item.cover_url.clone();
+                }
             }
         }
         // Assets without a catalog entry (UE samples, DLC placeholders, unreleased builds) end up
@@ -723,7 +757,7 @@ impl<'a> Api<'a> {
         // but get a readable placeholder instead of a bare GUID.
         // Resolve codenames before parent matching: `mainGameItem.title` is compared against the
         // final store title, so title resolution has to happen before the unnamed placeholder.
-        self.enrich_titles_from_egdata(&mut games);
+        self.enrich_from_egdata(&mut games);
         let overrides = load_title_overrides();
         if !overrides.is_empty() {
             let mut applied = 0;
@@ -939,6 +973,48 @@ fn release_app_names(value: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Key image types in the order that looks best in a portrait library grid.
+///
+/// Epic returns several crops for most items. The tall box art is the one the store itself uses in
+/// shelves; wide storefront art is only a fallback because the desktop grid crops it heavily.
+const COVER_PRIORITY: [&str; 8] = [
+    "DieselGameBoxTall",
+    "OfferImageTall",
+    "DieselStoreFrontTall",
+    "Thumbnail",
+    "DieselGameBox",
+    "DieselStoreFrontWide",
+    "OfferImageWide",
+    "featured",
+];
+
+/// Pick the best cover URL out of a catalog/egdata `keyImages` array.
+///
+/// Only absolute https URLs are accepted: the value is later handed to the downloader, and a
+/// catalog response must never be able to turn into a local-file read. Returns an empty string when
+/// there is no usable image; callers show a generated placeholder in that case.
+fn pick_key_image(item: &serde_json::Value) -> String {
+    let Some(images) = item.get("keyImages").and_then(|value| value.as_array()) else {
+        return String::new();
+    };
+    let url_of = |image: &serde_json::Value| -> Option<String> {
+        let url = image.get("url").and_then(|value| value.as_str()).unwrap_or("").trim();
+        (url.starts_with("https://") && !url.contains(char::is_whitespace)).then(|| url.to_string())
+    };
+
+    for wanted in COVER_PRIORITY {
+        for image in images {
+            if image.get("type").and_then(|value| value.as_str()) != Some(wanted) {
+                continue;
+            }
+            if let Some(url) = url_of(image) {
+                return url;
+            }
+        }
+    }
+    images.iter().find_map(url_of).unwrap_or_default()
+}
+
 fn parse_catalog(value: &serde_json::Value, namespace: &str, out: &mut BTreeMap<String, CatalogItem>) {
     let map = value
         .get("items")
@@ -995,6 +1071,7 @@ fn parse_catalog(value: &serde_json::Value, namespace: &str, out: &mut BTreeMap<
                     .unwrap_or_default(),
                 main_game_app_names: main_game.map(release_app_names).unwrap_or_default(),
                 release_app_names: release_app_names(item),
+                cover_url: pick_key_image(item),
             },
         );
     }
@@ -1346,6 +1423,45 @@ mod tests {
         let mut out = BTreeMap::new();
         parse_catalog(&value, "ns", &mut out);
         assert_eq!(out.get("cid").unwrap().folder_name, "Plain");
+    }
+
+    #[test]
+    fn parses_catalog_cover_image() {
+        let value = json!({
+            "items": {
+                "cid": {
+                    "title": "T",
+                    "keyImages": [
+                        { "type": "DieselGameBox", "url": "https://cdn.example/wide" },
+                        { "type": "DieselGameBoxTall", "url": "https://cdn.example/tall" }
+                    ]
+                }
+            }
+        });
+        let mut out = BTreeMap::new();
+        parse_catalog(&value, "ns", &mut out);
+        assert_eq!(out.get("cid").unwrap().cover_url, "https://cdn.example/tall");
+    }
+
+    #[test]
+    fn cover_selection_uses_priority_and_https_only() {
+        let value = json!({
+            "keyImages": [
+                { "type": "Thumbnail", "url": "https://cdn.example/thumb" },
+                { "type": "OfferImageTall", "url": "https://cdn.example/tall" },
+                { "type": "DieselGameBoxTall", "url": "file:///local/secret" },
+                { "type": "DieselGameBoxTall", "url": "https://cdn.example/best" }
+            ]
+        });
+        assert_eq!(pick_key_image(&value), "https://cdn.example/best");
+
+        let no_https = json!({
+            "keyImages": [
+                { "type": "DieselGameBoxTall", "url": "javascript:alert(1)" },
+                { "type": "DieselGameBox", "url": "http://cdn.example/plain-http" }
+            ]
+        });
+        assert_eq!(pick_key_image(&no_https), "");
     }
 
     #[test]
