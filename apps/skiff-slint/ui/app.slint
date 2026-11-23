@@ -1303,6 +1303,18 @@ export component AppWindow inherits Window {
     in property <int> selected-install-status: 0;
     in property <string> detail-error: "";
 
+    // ---- pre-download disk-space gate ------------------------------------
+    // Filled by the timer in main.rs from the cached estimate + a live volume reading.
+    in property <bool> space-pending: false;
+    in property <bool> space-known: false;
+    in property <bool> space-fits: true;
+    in property <bool> install-enabled: true;
+    in property <string> space-required-text: "—";
+    in property <string> space-free-text: "—";
+    in property <string> space-detail-text: "";
+    in property <string> space-note: "";
+    in property <int> space-note-tone: 0; // 0 = muted, 1 = ok, 2 = warn, 3 = err
+
     // ---- dialogs / settings form -----------------------------------------
     in-out property <bool> setup-open: false;
     in-out property <string> auth-url: "";
@@ -1327,6 +1339,7 @@ export component AppWindow inherits Window {
     callback pause();
     callback resume-job();
     callback cancel-job();
+    callback retry-space();
     callback save-settings();
     callback finish-setup();
     callback login-code-submit(string);
@@ -2327,6 +2340,84 @@ export component AppWindow inherits Window {
                                 }
                             }
 
+                            // Pre-download space budget: what the install still needs vs. what the
+                            // target volume has left. Filled before the install button can be used.
+                            InsetBox {
+                                VerticalLayout {
+                                    padding: 14px;
+                                    spacing: 8px;
+
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        Text {
+                                            text: "存储空间";
+                                            color: Theme.dim;
+                                            font-size: 10px;
+                                            font-weight: 700;
+                                            vertical-alignment: center;
+                                        }
+                                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                                        if root.space-pending : Text {
+                                            text: "计算中…";
+                                            color: Theme.accent;
+                                            font-size: 10px;
+                                            vertical-alignment: center;
+                                        }
+                                        if !root.space-known && !root.space-pending : VerticalLayout {
+                                            alignment: center;
+                                            AppButton {
+                                                label: "重新计算";
+                                                flat: true;
+                                                compact: true;
+                                                width: 78px;
+                                                clicked => { root.retry-space(); }
+                                            }
+                                        }
+                                    }
+
+                                    HorizontalLayout {
+                                        spacing: 18px;
+                                        VerticalLayout {
+                                            spacing: 2px;
+                                            Text { text: "所需空间"; color: Theme.muted; font-size: 10px; }
+                                            Text {
+                                                text: root.space-required-text;
+                                                color: Theme.text;
+                                                font-size: 15px;
+                                                font-weight: 700;
+                                            }
+                                        }
+                                        Rectangle { width: 1px; height: 34px; background: Theme.line-soft; }
+                                        VerticalLayout {
+                                            spacing: 2px;
+                                            Text { text: "目标盘剩余"; color: Theme.muted; font-size: 10px; }
+                                            Text {
+                                                text: root.space-free-text;
+                                                color: root.space-known && !root.space-fits ? Theme.err : Theme.text;
+                                                font-size: 15px;
+                                                font-weight: 700;
+                                            }
+                                        }
+                                    }
+
+                                    if root.space-detail-text != "" : Text {
+                                        text: root.space-detail-text;
+                                        color: Theme.dim;
+                                        font-size: 10px;
+                                        wrap: word-wrap;
+                                    }
+                                    if root.space-note != "" : Text {
+                                        text: root.space-note;
+                                        color: root.space-note-tone == 3 ? Theme.err
+                                            : root.space-note-tone == 2 ? Theme.warn
+                                            : root.space-note-tone == 1 ? Theme.ok
+                                            : Theme.muted;
+                                        font-size: 10px;
+                                        wrap: word-wrap;
+                                    }
+                                }
+                            }
+
                             // Add-ons section card
                             if root.selected-dlc-count > 0 : InsetBox {
                                 VerticalLayout {
@@ -2400,11 +2491,17 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
+                        if !root.job-running && root.space-known && !root.space-fits : NoticeBanner {
+                            text: "剩余空间不足，无法开始下载。请清理磁盘或更换安装目录。";
+                            tone: 3;
+                        }
                         if !root.job-running : AppButton {
-                            label: root.selected-install-status == 2 || root.can-resume ? "继续安装"
+                            label: root.space-pending ? "正在检查空间…"
+                                : root.selected-install-status == 2 || root.can-resume ? "继续安装"
                                 : root.selected-install-status == 1 ? "校验并更新"
                                 : "开始安装";
                             primary: true;
+                            enabled: root.install-enabled;
                             clicked => { root.install(); }
                         }
                     }

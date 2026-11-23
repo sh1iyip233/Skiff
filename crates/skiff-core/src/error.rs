@@ -26,6 +26,15 @@ pub enum Error {
     Manifest(String),
     /// Local integrity check failed.
     Integrity(String),
+    /// The target volume cannot hold the install; checked before anything is written.
+    Disk {
+        /// Bytes the install still has to allocate.
+        needed: u64,
+        /// Bytes the target volume has left.
+        free: u64,
+        /// Install directory the check ran against.
+        path: std::path::PathBuf,
+    },
     /// The user stopped an install.
     Cancelled {
         /// Files deleted while cleaning up a cancelled (as opposed to paused) install.
@@ -55,6 +64,7 @@ impl Error {
             Error::Auth(_) => "auth",
             Error::Manifest(_) => "manifest",
             Error::Integrity(_) => "integrity",
+            Error::Disk { .. } => "disk",
             Error::Cancelled { .. } => "cancelled",
             Error::ChunkCorrupt { .. } => "chunk_corrupt",
         }
@@ -92,6 +102,13 @@ impl fmt::Display for Error {
             Error::Auth(m) => write!(f, "authentication error: {m}"),
             Error::Manifest(m) => write!(f, "manifest error: {m}"),
             Error::Integrity(m) => write!(f, "integrity error: {m}"),
+            Error::Disk { needed, free, path } => write!(
+                f,
+                "not enough disk space in {}: need {}, {} free",
+                path.display(),
+                crate::util::human_bytes(*needed),
+                crate::util::human_bytes(*free)
+            ),
             Error::Cancelled { removed, kept_existing_install } => {
                 if *kept_existing_install {
                     write!(f, "cancelled by user (kept the existing install)")
@@ -125,3 +142,22 @@ impl From<std::io::Error> for Error {
 
 /// Crate-wide result alias.
 pub type Result<T> = std::result::Result<T, Error>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disk_errors_say_what_is_missing() {
+        let error = Error::Disk {
+            needed: 120 * 1024 * 1024 * 1024,
+            free: 40 * 1024 * 1024 * 1024,
+            path: std::path::PathBuf::from("D:\\Games\\Game"),
+        };
+        assert_eq!(error.kind(), "disk");
+        let text = error.to_string();
+        assert!(text.contains("D:\\Games\\Game"), "{text}");
+        assert!(text.contains("120.00 GiB"), "{text}");
+        assert!(text.contains("40.00 GiB"), "{text}");
+    }
+}
