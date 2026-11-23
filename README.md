@@ -15,6 +15,7 @@
 - **游戏库与封面**：拉取游戏库，按 Epic 目录的 `mainGameItem` 自动把 DLC 归到对应主游戏下面；桌面端以封面网格展示主游戏，附加内容单独一栏，封面按需下载并缓存到本地。安装主游戏时默认把已拥有的 DLC 一起装进同一目录（加 `--no-dlc` 可关闭）。
 - **独立的下载页面**：桌面端的下载进度、暂停/取消和续传都放在「下载」页，游戏库页只负责挑选和安装，不再挤在同一个界面里。下载、校验、修复三个阶段都显示实时进度。
 - **给已装好的游戏补 DLC**：`skiff dlc add` 只解析并下载缺的那个 DLC，本体不重新解析、不重新下载、不重新校验；`.egstore` 里本体和已装 DLC 的清单原样保留，新 DLC 复用本体的 `InstallationGuid`。支持 `--dry-run` 先看体积再决定。
+- **卸载已安装的游戏**：桌面端在游戏详情里点「卸载」，确认框可以选择是否保留游戏文件；确认后会删除清单里的游戏文件（可选）和 `.egstore`，并同步清理官方启动器的 `.item` 与 EOSH 安装记录。卸载在后台执行，完成后游戏库的「已安装」状态立即刷新。
 - **多线程分块下载**：自己定下载并发数，支持多 CDN 节点轮转、连接复用和自动剔除连不上的节点（比如国内经常超时的 Akamai 节点）。
 - **校验与续传**：支持断点续传、逐块 SHA-1 / rolling hash 校验、zlib 解包，文件坏了可以用 `--repair` 只重下损坏的分块。
 - **兼容官方启动器**：自动写出 `.egstore`（`.item` / `.mancpn` / `.manifest`），也可以选择注册到官方启动器（注册后需要把启动器从托盘完全退出再打开才生效，见下文）。
@@ -101,6 +102,21 @@ skiff dlc add  "Cyberpunk 2077" "Phantom Liberty"   # 只补指定的那个，�
 
 退出码和 `install` 一致；`--register-launcher` 只把新 DLC 的 `.item` 拷给官方启动器，本体的注册不动。
 
+## 卸载
+
+桌面端：在游戏库里选中已安装的游戏，打开详情抽屉，底部「卸载」→ 确认框里决定是否保留游戏文件 → 确认。卸载在后台线程执行，进度期间不能重复点击，也不会和正在运行的下载任务冲突。
+
+命令行：
+
+```powershell
+skiff uninstall "D:\Games\Cyberpunk2077"
+skiff uninstall "D:\Games\Cyberpunk2077" --keep-files
+```
+
+默认会删除清单里的游戏文件、剪掉空目录，并清理 `.egstore`、`%ProgramData%\Epic\EpicGamesLauncher\Data\Manifests\` 里对应的 `.item` 和 EOS Install Helper 的安装记录。目录里不在清单内的文件（比如自己放进去的存档或配置）不会被递归删除；如果还有剩余，程序会保留目录并提示。
+
+`--keep-files`（桌面端即取消勾选「同时删除游戏文件」）只移除 `.egstore` 安装记录和官方启动器记录，游戏文件原样保留。此后 Skiff 和官方启动器都不再把它当作已安装；想恢复需要重新安装。
+
 ## 并发与限速
 
 下载线程数完全按你设定的来，程序不会偷偷帮你调高或调低。填超范围会直接报错（退出码 2），安装完后会打印实际峰值并发 `peak inflight` 供核对。
@@ -174,6 +190,8 @@ skiff debug cdn-probe <appName>
 
 删掉 `.egstore` 后官方启动器就认不出这个游戏了；用 `skiff uninstall` 卸载时会一并清理 `.egstore`、`%ProgramData%\Epic\EpicGamesLauncher\Data\Manifests\` 里对应的 `.item`，以及 EOS Install Helper 的安装记录（见下）。
 
+桌面端详情抽屉里的「卸载」走同一套逻辑：默认删除游戏文件；取消勾选「同时删除游戏文件」则只删安装记录（整个 `.egstore`）和官方启动器记录，保留游戏文件。保留文件后 Skiff 和官方启动器都不再视为已安装，之后想恢复需要重新安装。
+
 **注册到官方启动器到底写了什么**：从启动器 20.x（2026 年 11 月）开始，安装状态由 EOS Install Helper（EOSH）管理，只往 `%ProgramData%\Epic\EpicGamesLauncher\Data\Manifests\` 放 `.item` **已经不够了**——启动器每次启动都会执行一次对账：
 
 ```text
@@ -194,6 +212,8 @@ EOSH reconciliation: removing installation not reported by EOSH '.../<GUID>.item
 
 1. 右键任务栏通知区域里的 Epic 图标 → **退出**（只点窗口右上角的 × 只是最小化到托盘，进程还在，等于没重启）；
 2. 重新打开 Epic 启动器，游戏就会显示为「已安装」，可以直接开始游戏。
+
+卸载同理：如果卸载时启动器正在运行，需要从托盘完全退出再重新打开，已卸载的游戏才会从官方库里消失。桌面端的卸载结果里也会给出这条提示。
 
 如果清单被启动器清掉了（比如启动器大版本更新之后），不用重装，直接补注册即可：
 
@@ -245,6 +265,7 @@ cargo +stable-x86_64-pc-windows-gnu test -p skiff-core --offline
 7. **只买了 DLC 没买本体**：`library list --all` 能看到，但无法单独安装（补装到已装好的本体上是支持的，见 `skiff dlc add`）。
 8. **中途强退的进度损耗**：续传记录每 64 个分块刷一次盘，按 `Ctrl-C` 最多重下不到 64 MiB。
 9. **官方启动器对合并 DLC 的识别**：`.item` 字段是照着官方样本拼的，万一启动器把某个 DLC 标成未安装，一般不影响主游戏正常游玩。
+10. **桌面端卸载的识别范围**：只识别配置的 `install_root` 下扫描到的安装；用 `--dir` 装到别处的目录，请用 `skiff uninstall <目录>` 指定卸载。卸载只删除清单内文件，清单外的存档/配置会保留并提示，不会强行结束正在运行的游戏。
 
 <details>
 <summary>开发备忘：实测踩过的 Epic 接口坑</summary>

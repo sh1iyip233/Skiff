@@ -2115,35 +2115,168 @@ pub fn inspect_install(install_dir: &Path) -> Result<InstalledInfo> {
     })
 }
 
-/// Uninstall: remove `.egstore` and (optionally) game files, then drop the launcher manifests.
-///
-/// Every component of a bundled install is removed: the main game and each add-on.
-pub fn uninstall(install_dir: &Path, keep_files: bool, app_name: &str) -> Result<()> {
-    let components = load_installed_components(install_dir).unwrap_or_default();
-    if !keep_files {
-        for component in &components {
-            for file in &component.manifest.files {
-                if let Ok(rel) = util::sanitize_rel_path(&file.path) {
-                    let path = util::install_path(install_dir, &rel);
-                    let _ = std::fs::remove_file(&path);
+/// What one uninstall removed, kept so a front-end can report failures instead of silently
+/// pretending everything worked.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct UninstallReport {
+    /// Number of components in this install (main game + add-ons).
+    pub components: usize,
+    /// Files deleted successfully.
+    pub files_removed: usize,
+    /// Manifest/ledger entries that no longer existed.
+    pub files_missing: usize,
+    /// Logical size of the deleted files (manifest sizes where known).
+    pub bytes_removed: u64,
+    /// Number of files that could not be deleted; `failed` keeps the first entries.
+    pub failed_count: usize,
+    pub failed: Vec<String>,
+    /// Empty directories pruned after the files were removed.
+    pub directories_removed: usize,
+    /// True when the install directory itself was empty and got removed.
+    pub install_dir_removed: bool,
+    /// Top-level entries left in the install directory (0 when it was removed).
+    pub leftover_entries: usize,
+    /// True when the caller asked to keep the game files.
+    pub keep_files: bool,
+    /// True when `.egstore` (the installation record) was removed.
+    pub metadata_removed: bool,
+    /// True when the launcher stores were updated successfully.
+    pub launcher_unregistered: bool,
+    /// Why the launcher stores could not be updated.
+    pub launcher_error: Option<String>,
+    /// Whether the official launcher was running after the uninstall.
+    pub launcher_running: bool,
+}
+
+/// Remove one file, clearing a read-only attribute once if that is what blocked the delete.
+fn remove_file_force(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
+            if let Ok(metadata) = std::fs::metadata(path) {
+                let mut permissions = metadata.permissions();
+                if permissions.readonly() {
+                    permissions.set_readonly(false);
+                    let _ = std::fs::set_permissions(path, permissions);
                 }
             }
+            std::fs::remove_file(path)
+        }
+        other => other,
+    }
+}
+
+/// Uninstall: remove `.egstore` and (optionally) game files, then drop the launcher manifests.
+///
+/// Every component of a bundled install is removed: the main game and each add-on. Files recorded
+/// by an interrupted update (`skiff.files`) are removed too. Files that are not listed in either
+/// place are never touched; the directory is only removed when it ends up empty.
+///
+/// `keep_files` keeps the game files but still removes the installation record, so both Skiff and
+/// the official launcher stop treating the directory as an installed game.
+pub fn uninstall(install_dir: &Path, keep_files: bool, app_name: &str) -> Result<UninstallReport> {
+    let egstore = install_dir.join(".egstore");
+    if !install_dir.is_dir() {
+        return Err(Error::usage(format!(
+            "{} is not an install directory",
+            install_dir.display()
+        )));
+    }
+    if !egstore.is_dir() {
+        return Err(Error::usage(format!(
+            "{} is not an install directory (no .egstore)",
+            install_dir.display()
+        )));
+    }
+
+    let components = load_installed_components(install_dir).unwrap_or_default();
+    let mut report =
+        UninstallReport { components: components.len(), keep_files, ..Default::default() };
+
+    // Manifest paths first, then the paths a paused update recorded. De-duplicate so a component
+    // shared between the main game and an add-on is only deleted (and counted) once.
+    let mut order: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut manifest_sizes: HashMap<String, u64> = HashMap::new();
+    for component in &components {
+        for file in &component.manifest.files {
+            let Ok(rel) = util::sanitize_rel_path(&file.path) else { continue };
+            if seen.insert(rel.clone()) {
+                manifest_sizes.insert(rel.clone(), file.size);
+                order.push(rel);
+            }
         }
     }
-    let egstore = install_dir.join(".egstore");
-    if let Ok(entries) = std::fs::read_dir(&egstore) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let is_item = path.extension().map(|e| e == "item").unwrap_or(false);
-            if keep_files && !is_item {
+    for raw in load_files_list(install_dir) {
+        let Ok(rel) = util::sanitize_rel_path(&raw) else { continue };
+        if seen.insert(rel.clone()) {
+            order.push(rel);
+        }
+    }
+
+    if !keep_files {
+        let mut parents: Vec<PathBuf> = Vec::new();
+        for rel in &order {
+            let path = util::install_path(install_dir, rel);
+            if !util::is_within(install_dir, &path) {
                 continue;
             }
-            let _ = std::fs::remove_file(&path);
+            let size = manifest_sizes
+                .get(rel)
+                .copied()
+                .or_else(|| std::fs::metadata(&path).ok().map(|metadata| metadata.len()))
+                .unwrap_or(0);
+            match remove_file_force(&path) {
+                Ok(()) => {
+                    report.files_removed += 1;
+                    report.bytes_removed += size;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    report.files_missing += 1;
+                }
+                Err(err) => {
+                    report.failed_count += 1;
+                    if report.failed.len() < 20 {
+                        report.failed.push(format!("{rel}: {err}"));
+                    }
+                }
+            }
+            // Collect every ancestor, not just the immediate parent, so a deep tree such as
+            // `a/b/c.bin` does not leave empty `a` and `b` folders behind.
+            let mut cursor = path.parent();
+            while let Some(dir) = cursor {
+                if dir == install_dir || !util::is_within(install_dir, dir) {
+                    break;
+                }
+                parents.push(dir.to_path_buf());
+                cursor = dir.parent();
+            }
+        }
+
+        let mut unique: HashSet<PathBuf> = HashSet::new();
+        parents.retain(|path| unique.insert(path.clone()));
+        parents.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+        for dir in parents {
+            if dir != install_dir
+                && util::is_within(install_dir, &dir)
+                && std::fs::remove_dir(&dir).is_ok()
+            {
+                report.directories_removed += 1;
+            }
         }
     }
-    // A full uninstall leaves no metadata behind; `keep_files` keeps the manifests and the directory.
-    if !keep_files {
-        let _ = std::fs::remove_dir(&egstore);
+
+    // `keep_files` still drops `.egstore`: that record is what makes the directory "installed" for
+    // both Skiff's local scan and the official launcher.
+    report.metadata_removed = match std::fs::remove_dir_all(&egstore) {
+        Ok(()) => true,
+        Err(_) => !egstore.exists(),
+    };
+
+    if !keep_files && (!install_dir.exists() || std::fs::remove_dir(install_dir).is_ok()) {
+        report.install_dir_removed = true;
+    } else {
+        report.leftover_entries =
+            std::fs::read_dir(install_dir).map(|entries| entries.count()).unwrap_or(0);
     }
 
     let base_app = components
@@ -2151,20 +2284,24 @@ pub fn uninstall(install_dir: &Path, keep_files: bool, app_name: &str) -> Result
         .map(|component| component.main_app_name.clone())
         .filter(|name| !name.is_empty())
         .unwrap_or_else(|| app_name.to_string());
-    if base_app.is_empty() {
-        // Without an app name there is nothing we can safely identify in ProgramData.
-        return Ok(());
-    }
     let mut app_set: HashSet<String> = components
         .iter()
         .map(|component| component.app_name.to_lowercase())
         .filter(|name| !name.is_empty())
         .collect();
-    app_set.insert(base_app.to_lowercase());
-    // Drops both the `.item` files and the EOSH installation records; the latter are what a 20.x
-    // launcher actually consults, and leaving them behind makes it re-add the install.
-    let _ = crate::launcher::unregister(&app_set);
-    Ok(())
+    if !base_app.is_empty() {
+        app_set.insert(base_app.to_lowercase());
+    }
+    if !app_set.is_empty() {
+        // Drops both the `.item` files and the EOSH installation records; the latter are what a
+        // 20.x launcher actually consults, and leaving them behind makes it re-add the install.
+        match crate::launcher::unregister(&app_set) {
+            Ok(()) => report.launcher_unregistered = true,
+            Err(err) => report.launcher_error = Some(err.to_string()),
+        }
+    }
+    report.launcher_running = crate::launcher::launcher_running();
+    Ok(report)
 }
 
 /// Helper used by CLI: map a raw game entry plus config into an install directory.
@@ -2477,6 +2614,19 @@ mod tests {
         }
     }
 
+    /// A manifest entry whose serialized size survives `write_binary`/`parse` (the parser recomputes
+    /// `size` from the chunk parts, so a part is required for a non-zero size).
+    fn sized_file(path: &str, size: u32) -> FileManifest {
+        let mut entry = file(path, 1, u64::from(size));
+        entry.parts = vec![ChunkPart {
+            guid: [1, 2, 3, 4],
+            chunk_offset: 0,
+            size,
+            file_offset: 0,
+        }];
+        entry
+    }
+
     fn chunk(guid: u32, size: i64, sha: u8) -> ChunkInfo {
         ChunkInfo {
             guid: [guid, 0, 0, 0],
@@ -2586,5 +2736,98 @@ mod tests {
         assert_eq!(find_existing_install(&root, "Base"), Some(dir.clone()));
         assert!(find_existing_install(&root, "Other").is_none());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Create a readable install fixture: `.item`/`.mancpn`/`.manifest` plus a manifest that lists
+    /// `files`. The caller creates the actual game files.
+    fn egstore_install(tag: &str, files: Vec<FileManifest>) -> PathBuf {
+        let dir = temp_dir(tag);
+        let mut base = component("Base", 18, files, Vec::new());
+        // `write_egstore_components` writes `raw`, and the uninstall path parses it back.
+        base.raw = base.manifest.write_binary().unwrap();
+        write_egstore_components(&dir, &[base], 0).unwrap();
+        dir
+    }
+
+    #[test]
+    fn uninstall_removes_files_and_the_empty_install_directory() {
+        let dir = egstore_install(
+            "uninstall-full",
+            vec![sized_file("a.txt", 5), sized_file("sub/b.txt", 6)],
+        );
+        std::fs::write(dir.join("a.txt"), b"hello").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("sub/b.txt"), b"world!").unwrap();
+
+        let report = uninstall(&dir, false, "Base").unwrap();
+
+        assert_eq!(report.components, 1);
+        assert_eq!(report.files_removed, 2);
+        assert_eq!(report.files_missing, 0);
+        assert_eq!(report.bytes_removed, 11);
+        assert_eq!(report.failed_count, 0);
+        assert!(report.metadata_removed);
+        assert!(report.install_dir_removed, "the empty install directory should be removed");
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn uninstall_with_keep_files_keeps_the_game_but_drops_the_metadata() {
+        let dir = egstore_install("uninstall-keep", vec![file("a.txt", 1, 5)]);
+        std::fs::write(dir.join("a.txt"), b"hello").unwrap();
+
+        let report = uninstall(&dir, true, "Base").unwrap();
+
+        assert!(report.keep_files);
+        assert_eq!(report.files_removed, 0);
+        assert!(dir.join("a.txt").exists(), "keep_files must not touch the game files");
+        assert!(!dir.join(".egstore").exists(), "the install record must be removed");
+        assert!(report.metadata_removed);
+        assert!(!report.install_dir_removed);
+        assert_eq!(report.leftover_entries, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn uninstall_keeps_unlisted_files_and_reports_them() {
+        let dir = egstore_install("uninstall-leftover", vec![file("a.txt", 1, 5)]);
+        std::fs::write(dir.join("a.txt"), b"hello").unwrap();
+        std::fs::write(dir.join("save.dat"), b"keep me").unwrap();
+
+        let report = uninstall(&dir, false, "Base").unwrap();
+
+        assert_eq!(report.files_removed, 1);
+        assert!(!report.install_dir_removed);
+        assert!(dir.join("save.dat").exists(), "files outside the manifest must survive");
+        assert!(report.leftover_entries >= 1);
+        assert!(!dir.join(".egstore").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn uninstall_cleans_a_partial_download_without_components() {
+        let dir = temp_dir("uninstall-partial");
+        std::fs::create_dir_all(dir.join(".egstore")).unwrap();
+        let partial = file("chunks/part.bin", 1, 4);
+        save_files_list(&dir, &[("chunks/part.bin".to_string(), partial)]).unwrap();
+        std::fs::create_dir_all(dir.join("chunks")).unwrap();
+        std::fs::write(dir.join("chunks/part.bin"), b"data").unwrap();
+
+        let report = uninstall(&dir, false, "PartialGame").unwrap();
+
+        assert_eq!(report.components, 0);
+        assert_eq!(report.files_removed, 1);
+        assert!(report.metadata_removed);
+        assert!(report.install_dir_removed);
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn uninstall_rejects_a_directory_without_install_metadata() {
+        let dir = temp_dir("uninstall-empty");
+        let error = uninstall(&dir, false, "Base").expect_err("a plain directory is not an install");
+        assert!(matches!(error, Error::Usage(_)));
+        assert!(dir.exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

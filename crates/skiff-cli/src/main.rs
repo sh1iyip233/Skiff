@@ -1184,8 +1184,65 @@ fn cmd_uninstall(args: &Args, cfg: &Config) -> Result<()> {
         .ok()
         .and_then(|components| components.first().map(|component| component.main_app_name.clone()))
         .unwrap_or_default();
-    install::uninstall(&dir, args.has("keep-files"), &app)?;
-    println!("removed install metadata from {}", dir.display());
+    let report = install::uninstall(&dir, args.has("keep-files"), &app)?;
+
+    if args.has("json") {
+        let json = serde_json::to_string_pretty(&report)
+            .map_err(|e| Error::integrity(format!("cannot serialize uninstall report: {e}")))?;
+        println!("{json}");
+    } else {
+        if report.keep_files {
+            println!("kept game files in {}", dir.display());
+        } else {
+            println!(
+                "removed {} file(s) ({}) from {}",
+                report.files_removed,
+                util::human_bytes(report.bytes_removed),
+                dir.display()
+            );
+        }
+        if report.install_dir_removed {
+            println!("  directory : removed");
+        } else if report.keep_files {
+            println!("  directory : kept ({} item(s) remain)", report.leftover_entries);
+        } else if report.leftover_entries > 0 {
+            println!(
+                "  directory : kept ({} item(s) were not in the install manifest)",
+                report.leftover_entries
+            );
+        }
+        if report.files_missing > 0 {
+            println!("  missing   : {} file(s) were already gone", report.files_missing);
+        }
+        if report.failed_count > 0 {
+            eprintln!("warning: {} file(s) could not be removed", report.failed_count);
+            for path in report.failed.iter().take(10) {
+                eprintln!("  - {path}");
+            }
+        }
+        if report.metadata_removed {
+            println!("removed install metadata from {}", dir.display());
+        } else {
+            eprintln!("warning: the .egstore metadata could not be fully removed");
+        }
+        if let Some(err) = &report.launcher_error {
+            eprintln!("warning: could not update the Epic launcher records: {err}");
+        } else if report.launcher_unregistered {
+            println!("cleared Epic launcher registration");
+        }
+        if report.launcher_running {
+            println!(
+                "  提示        : Epic 启动器正在运行，请从托盘完全退出后重新打开，卸载才会在官方库里生效。"
+            );
+        }
+    }
+
+    if !report.metadata_removed {
+        return Err(Error::integrity(format!(
+            "could not remove {}",
+            dir.join(".egstore").display()
+        )));
+    }
     Ok(())
 }
 

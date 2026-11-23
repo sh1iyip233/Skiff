@@ -1302,6 +1302,14 @@ export component AppWindow inherits Window {
     in property <bool> can-resume: false;
     in property <int> selected-install-status: 0;
     in property <string> detail-error: "";
+    in property <string> detail-notice: "";
+    in property <int> detail-notice-tone: 1;
+
+    // ---- uninstall confirmation ------------------------------------------
+    in-out property <bool> uninstall-open: false;
+    in property <bool> uninstall-busy: false;
+    in property <string> uninstall-error: "";
+    in-out property <bool> uninstall-delete-files: true;
 
     // ---- dialogs / settings form -----------------------------------------
     in-out property <bool> setup-open: false;
@@ -1327,6 +1335,9 @@ export component AppWindow inherits Window {
     callback pause();
     callback resume-job();
     callback cancel-job();
+    callback request-uninstall();
+    callback confirm-uninstall();
+    callback cancel-uninstall();
     callback save-settings();
     callback finish-setup();
     callback login-code-submit(string);
@@ -1336,7 +1347,11 @@ export component AppWindow inherits Window {
         width: 100%;
         height: 100%;
         key-pressed(event) => {
-            if event.text == Key.Escape && root.detail-open && !root.setup-open {
+            if event.text == Key.Escape && root.uninstall-open && !root.uninstall-busy {
+                root.cancel-uninstall();
+                return accept;
+            }
+            if event.text == Key.Escape && root.detail-open && !root.setup-open && !root.uninstall-open {
                 root.detail-open = false;
                 return accept;
             }
@@ -2365,6 +2380,11 @@ export component AppWindow inherits Window {
                                 text: root.detail-error;
                                 tone: 3;
                             }
+
+                            if root.detail-notice != "" : NoticeBanner {
+                                text: root.detail-notice;
+                                tone: root.detail-notice-tone;
+                            }
                         }
                     }
 
@@ -2400,12 +2420,24 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
-                        if !root.job-running : AppButton {
-                            label: root.selected-install-status == 2 || root.can-resume ? "继续安装"
-                                : root.selected-install-status == 1 ? "校验并更新"
-                                : "开始安装";
-                            primary: true;
-                            clicked => { root.install(); }
+                        if !root.job-running : HorizontalLayout {
+                            spacing: 8px;
+
+                            AppButton {
+                                label: root.selected-install-status == 2 || root.can-resume ? "继续安装"
+                                    : root.selected-install-status == 1 ? "校验并更新"
+                                    : "开始安装";
+                                primary: true;
+                                horizontal-stretch: 1;
+                                clicked => { root.install(); }
+                            }
+
+                            if root.selected-install-status > 0 : AppButton {
+                                label: "卸载";
+                                danger: true;
+                                width: 84px;
+                                clicked => { root.request-uninstall(); }
+                            }
                         }
                     }
                 }
@@ -2673,6 +2705,146 @@ export component AppWindow inherits Window {
                             width: 112px;
                             enabled: root.logged-in;
                             clicked => { root.finish-setup(); }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ================= L3: UNINSTALL CONFIRMATION =================
+        if root.uninstall-open : Rectangle {
+            x: 0px;
+            y: 0px;
+            width: 100%;
+            height: 100%;
+            background: Theme.scrim-modal;
+
+            // Block pointer pass-through; clicking the scrim never dismisses a destructive action.
+            TouchArea { }
+
+            Rectangle {
+                width: min(460px, root.width - 48px);
+                height: min(root.height - 64px, 380px);
+                x: (root.width - self.width) / 2;
+                y: (root.height - self.height) / 2;
+                background: Theme.elevated;
+                border-radius: 18px;
+                border-width: 1px;
+                border-color: Theme.line-strong;
+                drop-shadow-blur: 32px;
+                drop-shadow-color: #000000cc;
+                drop-shadow-offset-y: 10px;
+
+                TouchArea { }
+
+                VerticalLayout {
+                    width: 100%;
+                    height: 100%;
+
+                    HorizontalLayout {
+                        padding-left: 20px;
+                        padding-right: 20px;
+                        padding-top: 18px;
+                        padding-bottom: 14px;
+                        spacing: 8px;
+
+                        Text {
+                            text: "卸载游戏";
+                            color: Theme.text;
+                            font-size: 15px;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                        Chip {
+                            label: root.selected-install-status == 2 ? "未完成安装" : "已安装";
+                            tone: root.selected-install-status == 2 ? Theme.warn : Theme.ok;
+                            bg: root.selected-install-status == 2 ? Theme.warn-soft : Theme.ok-soft;
+                        }
+                    }
+
+                    Rectangle { height: 1px; background: Theme.line-soft; }
+
+                    ScrollView {
+                        vertical-stretch: 1;
+
+                        VerticalLayout {
+                            padding: 20px;
+                            spacing: 12px;
+
+                            Text {
+                                text: "《" + root.selected-title + "》";
+                                color: Theme.text;
+                                font-size: 16px;
+                                font-weight: 700;
+                                wrap: word-wrap;
+                            }
+
+                            Text {
+                                text: "安装目录";
+                                color: Theme.dim;
+                                font-size: 10px;
+                                font-weight: 700;
+                            }
+
+                            Text {
+                                text: root.target-dir;
+                                color: Theme.text;
+                                font-size: 11px;
+                                wrap: word-wrap;
+                            }
+
+                            if root.selected-install-status == 1 : Switch {
+                                text: "同时删除游戏文件";
+                                checked <=> root.uninstall-delete-files;
+                            }
+
+                            NoticeBanner {
+                                text: root.selected-install-status == 2
+                                    ? "该安装尚未完成，卸载会删除已安装的文件、已下载的分块和续传记录。此操作不可撤销，请先完全退出游戏。"
+                                    : root.uninstall-delete-files
+                                        ? "会删除主游戏和已安装附加内容的游戏文件，并清理 .egstore、官方启动器 .item 与 EOSH 记录。此操作不可撤销，请先完全退出游戏。"
+                                        : "只移除安装记录（.egstore）和官方启动器记录，游戏文件会保留。之后想恢复为已安装需要重新安装。";
+                                tone: 2;
+                            }
+
+                            if root.uninstall-busy : Text {
+                                text: "正在删除文件，请稍候…";
+                                color: Theme.dim;
+                                font-size: 11px;
+                            }
+
+                            if root.uninstall-error != "" : NoticeBanner {
+                                text: root.uninstall-error;
+                                tone: 3;
+                            }
+                        }
+                    }
+
+                    Rectangle { height: 1px; background: Theme.line-soft; }
+
+                    HorizontalLayout {
+                        padding-left: 20px;
+                        padding-right: 20px;
+                        padding-top: 14px;
+                        padding-bottom: 16px;
+                        spacing: 8px;
+
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+
+                        AppButton {
+                            label: "取消";
+                            width: 88px;
+                            enabled: !root.uninstall-busy;
+                            clicked => { root.cancel-uninstall(); }
+                        }
+
+                        AppButton {
+                            label: root.uninstall-busy ? "正在卸载…" : "确认卸载";
+                            danger: true;
+                            width: 112px;
+                            enabled: !root.uninstall-busy;
+                            clicked => { root.confirm-uninstall(); }
                         }
                     }
                 }

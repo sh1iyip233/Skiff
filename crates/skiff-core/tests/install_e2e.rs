@@ -918,7 +918,12 @@ fn bundle_installs_base_and_dlc_into_one_directory() {
     assert_eq!(installed[0].app_name, "E2EGame");
     assert_eq!(install::load_installed_files(&dir).unwrap().len(), 3);
 
-    install::uninstall(&dir, false, "E2EGame").expect("uninstall should succeed");
+    let report = install::uninstall(&dir, false, "E2EGame").expect("uninstall should succeed");
+    assert_eq!(report.components, 2);
+    assert_eq!(report.files_removed, 3);
+    assert_eq!(report.failed_count, 0);
+    assert!(report.metadata_removed);
+    assert!(report.install_dir_removed, "the emptied install directory should be removed");
     assert!(!dir.join("dlc/c.bin").exists(), "DLC files must be removed");
     assert!(!egstore.exists(), "metadata must be removed");
 }

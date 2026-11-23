@@ -67,6 +67,73 @@ fn human_duration(secs: f64) -> String {
     }
 }
 
+/// Whether the confirmation switches should keep the game files. A partial install has no usable
+/// game to keep, so it always deletes its chunks even if the switch was left off.
+fn keep_files_for_uninstall(status: InstallStatus, delete_files: bool) -> bool {
+    status != InstallStatus::Partial && !delete_files
+}
+
+/// One-line result of an uninstall, plus the `NoticeBanner` tone (1 = ok, 2 = warn).
+fn format_uninstall_report(
+    report: &install::UninstallReport,
+    title: &str,
+    install_dir: &Path,
+    was_partial: bool,
+) -> (String, i32) {
+    const NOTICE_OK: i32 = 1;
+    const NOTICE_WARN: i32 = 2;
+
+    let mut tone = NOTICE_OK;
+    let mut parts: Vec<String> = Vec::new();
+
+    if was_partial {
+        parts.push(format!("已清理《{title}》的未完成安装"));
+    } else if report.keep_files {
+        parts.push(format!("已从库里移除《{title}》"));
+    } else {
+        parts.push(format!("已卸载《{title}》"));
+    }
+
+    if report.keep_files {
+        parts.push(format!("游戏文件保留在 {}", install_dir.display()));
+    } else {
+        parts.push(format!(
+            "删除 {} 个文件 · {}",
+            report.files_removed,
+            human_bytes(report.bytes_removed)
+        ));
+        if report.install_dir_removed {
+            parts.push("安装目录已移除".to_string());
+        } else if report.leftover_entries > 0 {
+            tone = NOTICE_WARN;
+            parts.push(format!("安装目录仍在（{} 项未列入清单）", report.leftover_entries));
+        }
+    }
+
+    if report.failed_count > 0 {
+        tone = NOTICE_WARN;
+        parts.push(format!("{} 个文件未能删除（可能正在运行或被占用）", report.failed_count));
+    }
+    if !report.metadata_removed {
+        tone = NOTICE_WARN;
+        parts.push("安装记录未能完全删除，可稍后重试".to_string());
+    }
+    if let Some(err) = &report.launcher_error {
+        tone = NOTICE_WARN;
+        parts.push(format!("Epic 启动器记录未清理：{err}"));
+    } else if report.launcher_running {
+        tone = NOTICE_WARN;
+        parts.push(
+            "Epic 启动器正在运行，请从托盘完全退出后重新打开，卸载才会在官方库里生效"
+                .to_string(),
+        );
+    } else if report.launcher_unregistered {
+        parts.push("Epic 启动器记录已清理".to_string());
+    }
+
+    (parts.join(" · "), tone)
+}
+
 /// First character of the account name, for the avatar circle.
 fn initial_of(name: &str) -> String {
     name.chars()
@@ -476,6 +543,14 @@ struct Snapshot {
     selected_install_status: i32,
     /// Error scoped to the detail drawer (kept separate from active download job `note`).
     detail_error: String,
+    /// Non-error result of the last detail action (uninstall summary, warnings).
+    detail_notice: String,
+    /// `NoticeBanner` tone for `detail_notice` (1 = ok, 2 = warn).
+    detail_notice_tone: i32,
+    /// Uninstall confirmation dialog state.
+    uninstall_open: bool,
+    uninstall_busy: bool,
+    uninstall_error: String,
     // job identity, so the download page keeps showing the right game even when another library
     // entry is selected
     job_started: bool,
@@ -667,6 +742,8 @@ struct State {
     stopping: AtomicBool,
     /// How the running install was asked to stop (pause keeps files, cancel deletes them).
     stop_kind: Mutex<Option<install::StopKind>>,
+    /// One uninstall at a time; also keeps a double click from starting two delete workers.
+    uninstalling: AtomicBool,
 }
 
 impl State {
@@ -680,6 +757,7 @@ impl State {
             needs_refresh: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
             stop_kind: Mutex::new(None),
+            uninstalling: AtomicBool::new(false),
         }
     }
 }
@@ -847,6 +925,10 @@ fn push_selection(ui: &AppWindow, state: &State) {
             snapshot.can_resume = false;
             snapshot.selected_install_status = InstallStatus::NotInstalled as i32;
             snapshot.detail_error.clear();
+            snapshot.detail_notice.clear();
+            snapshot.uninstall_open = false;
+            snapshot.uninstall_busy = false;
+            snapshot.uninstall_error.clear();
         });
         return;
     };
@@ -910,6 +992,43 @@ fn push_selection(ui: &AppWindow, state: &State) {
 // ---------------------------------------------------------------------------------------------
 // install job
 // ---------------------------------------------------------------------------------------------
+
+/// Resolve the selected game's install directory from the cached scan, falling back to the target
+/// shown in the detail drawer and then to a disk scan.
+fn selected_install_target(state: &State) -> Option<(String, PathBuf, InstallStatus, String)> {
+    let app = state.selected_app.lock().ok().and_then(|slot| slot.clone())?;
+    let (status, dir, title) = {
+        let library = state.library.lock().ok()?;
+        let group = library.group_any(&app)?;
+        (
+            library.status_of(&app),
+            library.local_dir_of(&app).map(Path::to_path_buf),
+            display_title(&group.game),
+        )
+    };
+    let dir = dir.or_else(|| {
+        let target = state
+            .snapshot
+            .lock()
+            .ok()
+            .map(|snapshot| snapshot.target_dir.clone())
+            .unwrap_or_default();
+        if !target.is_empty() {
+            let path = PathBuf::from(target);
+            if path.join(".egstore").is_dir() || install::has_partial_install(&path) {
+                return Some(path);
+            }
+        }
+        let root = state
+            .config
+            .lock()
+            .ok()
+            .map(|cfg| PathBuf::from(&cfg.install_root))
+            .unwrap_or_default();
+        install::find_existing_install(&root, &app)
+    })?;
+    Some((app, dir, status, title))
+}
 
 fn ratio_of(done: u64, total: u64) -> f32 {
     if total == 0 {
@@ -1037,6 +1156,9 @@ fn begin_install(
     app_name: &str,
     include_dlc: bool,
 ) -> Result<(), String> {
+    if state.uninstalling.load(Ordering::Relaxed) {
+        return Err("正在卸载游戏，请稍候".to_string());
+    }
     let group = state
         .library
         .lock()
@@ -1415,7 +1537,15 @@ fn main() -> Result<(), slint::PlatformError> {
             if let Ok(mut slot) = state.selected_app.lock() {
                 *slot = Some(app_name);
             }
-            edit(&state, |snapshot| snapshot.detail_error.clear());
+            edit(&state, |snapshot| {
+                snapshot.detail_error.clear();
+                snapshot.detail_notice.clear();
+                snapshot.uninstall_open = false;
+                snapshot.uninstall_busy = false;
+                snapshot.uninstall_error.clear();
+            });
+            ui.set_uninstall_open(false);
+            ui.set_uninstall_error(SharedString::default());
             push_selection(&ui, &state);
         });
     }
@@ -1566,7 +1696,12 @@ fn main() -> Result<(), slint::PlatformError> {
             let include_dlc = ui.get_include_dlc();
             match begin_install(&state, &app_name, include_dlc) {
                 Ok(()) => {
-                    edit(&state, |snapshot| snapshot.detail_error.clear());
+                    edit(&state, |snapshot| {
+                        snapshot.detail_error.clear();
+                        snapshot.detail_notice.clear();
+                        snapshot.uninstall_open = false;
+                        snapshot.uninstall_error.clear();
+                    });
                     ui.set_page(1);
                     ui.set_detail_open(false);
                 }
@@ -1574,6 +1709,142 @@ fn main() -> Result<(), slint::PlatformError> {
                     snapshot.detail_error = message;
                 }),
             }
+        });
+    }
+
+    // ---- uninstall -----------------------------------------------------------------------
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_request_uninstall(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            if state.uninstalling.load(Ordering::Relaxed) {
+                return;
+            }
+            if state.snapshot.lock().map(|snapshot| snapshot.running).unwrap_or(false) {
+                edit(&state, |snapshot| {
+                    snapshot.detail_error = "有下载任务正在运行，请先完成或暂停后再卸载。".to_string();
+                });
+                return;
+            }
+            let Some((_, dir, status, _title)) = selected_install_target(&state) else {
+                edit(&state, |snapshot| {
+                    snapshot.detail_error = "没有找到本地安装目录，请刷新游戏库后重试。".to_string();
+                });
+                return;
+            };
+            if status == InstallStatus::NotInstalled
+                && !dir.join(".egstore").is_dir()
+                && !install::has_partial_install(&dir)
+            {
+                edit(&state, |snapshot| {
+                    snapshot.detail_error = "没有检测到本地安装。".to_string();
+                });
+                return;
+            }
+            edit(&state, |snapshot| {
+                snapshot.uninstall_open = true;
+                snapshot.uninstall_busy = false;
+                snapshot.uninstall_error.clear();
+                snapshot.detail_error.clear();
+                snapshot.detail_notice.clear();
+            });
+            ui.set_uninstall_open(true);
+            ui.set_uninstall_busy(false);
+            ui.set_uninstall_error(SharedString::default());
+            ui.set_uninstall_delete_files(true);
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_cancel_uninstall(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            if state.snapshot.lock().map(|snapshot| snapshot.uninstall_busy).unwrap_or(false) {
+                return;
+            }
+            edit(&state, |snapshot| {
+                snapshot.uninstall_open = false;
+                snapshot.uninstall_error.clear();
+            });
+            ui.set_uninstall_open(false);
+            ui.set_uninstall_error(SharedString::default());
+        });
+    }
+    {
+        let ui_weak = ui.as_weak();
+        let state = state.clone();
+        ui.on_confirm_uninstall(move || {
+            let Some(ui) = ui_weak.upgrade() else { return };
+            if state.snapshot.lock().map(|snapshot| snapshot.running).unwrap_or(false) {
+                edit(&state, |snapshot| {
+                    snapshot.uninstall_error = "有下载任务正在运行，请先完成或暂停。".to_string();
+                });
+                return;
+            }
+            if state.uninstalling.swap(true, Ordering::SeqCst) {
+                return;
+            }
+
+            let Some((app, dir, status, title)) = selected_install_target(&state) else {
+                state.uninstalling.store(false, Ordering::SeqCst);
+                edit(&state, |snapshot| {
+                    snapshot.uninstall_error = "没有找到本地安装目录，请关闭后重试。".to_string();
+                });
+                return;
+            };
+            if status == InstallStatus::NotInstalled
+                && !dir.join(".egstore").is_dir()
+                && !install::has_partial_install(&dir)
+            {
+                state.uninstalling.store(false, Ordering::SeqCst);
+                edit(&state, |snapshot| {
+                    snapshot.uninstall_error = "没有检测到本地安装，无法卸载。".to_string();
+                });
+                return;
+            }
+
+            // A partial install always deletes its chunks; for a finished install the confirmation
+            // switch decides whether the game files survive.
+            let was_partial = status == InstallStatus::Partial;
+            let keep_files = keep_files_for_uninstall(status, ui.get_uninstall_delete_files());
+            edit(&state, |snapshot| {
+                snapshot.uninstall_busy = true;
+                snapshot.uninstall_error.clear();
+            });
+            ui.set_uninstall_busy(true);
+
+            let worker = state.clone();
+            std::thread::spawn(move || {
+                let result = install::uninstall(&dir, keep_files, &app);
+                let install_root = worker
+                    .config
+                    .lock()
+                    .map(|cfg| PathBuf::from(&cfg.install_root))
+                    .unwrap_or_default();
+                if let Ok(mut library) = worker.library.lock() {
+                    library.rescan_local(&install_root);
+                }
+
+                match result {
+                    Ok(report) => {
+                        let (notice, tone) =
+                            format_uninstall_report(&report, &title, &dir, was_partial);
+                        edit(&worker, |snapshot| {
+                            snapshot.uninstall_busy = false;
+                            snapshot.uninstall_open = false;
+                            snapshot.detail_error.clear();
+                            snapshot.detail_notice = notice;
+                            snapshot.detail_notice_tone = tone;
+                        });
+                    }
+                    Err(err) => edit(&worker, |snapshot| {
+                        snapshot.uninstall_busy = false;
+                        snapshot.uninstall_error = format!("卸载失败：{err}");
+                    }),
+                }
+                worker.uninstalling.store(false, Ordering::SeqCst);
+            });
         });
     }
     {
@@ -1859,6 +2130,11 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_selected_dlc_count(snapshot.selected_dlc_count as i32);
             ui.set_selected_dlc_text(SharedString::from(snapshot.selected_dlc_text.clone()));
             ui.set_detail_error(SharedString::from(snapshot.detail_error.clone()));
+            ui.set_detail_notice(SharedString::from(snapshot.detail_notice.clone()));
+            ui.set_detail_notice_tone(snapshot.detail_notice_tone);
+            ui.set_uninstall_open(snapshot.uninstall_open);
+            ui.set_uninstall_busy(snapshot.uninstall_busy);
+            ui.set_uninstall_error(SharedString::from(snapshot.uninstall_error.clone()));
 
             ui.set_refresh_busy(snapshot.refresh_busy);
             ui.set_refresh_progress(snapshot.refresh_progress);
@@ -2220,5 +2496,95 @@ mod tests {
         assert_eq!(snapshot.speed_label, "修复速度");
         assert_eq!(snapshot.bytes_label, "已修复 / 总计");
         assert!(snapshot.note.contains("重新下载"));
+    }
+
+    #[test]
+    fn uninstall_switch_keeps_files_only_for_a_finished_install() {
+        assert!(!keep_files_for_uninstall(InstallStatus::Installed, true));
+        assert!(keep_files_for_uninstall(InstallStatus::Installed, false));
+        assert!(
+            !keep_files_for_uninstall(InstallStatus::Partial, false),
+            "a partial install always deletes its chunks"
+        );
+    }
+
+    #[test]
+    fn uninstall_report_summarizes_a_full_uninstall() {        let report = install::UninstallReport {
+            components: 2,
+            files_removed: 12,
+            bytes_removed: 2048,
+            metadata_removed: true,
+            install_dir_removed: true,
+            launcher_unregistered: true,
+            ..Default::default()
+        };
+
+        let (text, tone) =
+            format_uninstall_report(&report, "Brotato", Path::new("D:/Games/Brotato"), false);
+
+        assert_eq!(tone, 1);
+        assert!(text.contains("已卸载《Brotato》"));
+        assert!(text.contains("删除 12 个文件"));
+        assert!(text.contains("2.00 KiB"));
+        assert!(text.contains("安装目录已移除"));
+        assert!(text.contains("Epic 启动器记录已清理"));
+        assert!(!text.contains("未能删除"));
+    }
+
+    #[test]
+    fn uninstall_report_names_the_kept_directory_and_launcher_restart() {
+        let report = install::UninstallReport {
+            keep_files: true,
+            metadata_removed: true,
+            launcher_unregistered: true,
+            launcher_running: true,
+            leftover_entries: 4,
+            ..Default::default()
+        };
+
+        let (text, tone) =
+            format_uninstall_report(&report, "Brotato", Path::new("D:/Games/Brotato"), false);
+
+        assert_eq!(tone, 2);
+        assert!(text.contains("已从库里移除《Brotato》"));
+        assert!(text.contains("游戏文件保留在 D:/Games/Brotato"));
+        assert!(text.contains("从托盘完全退出"));
+    }
+
+    #[test]
+    fn uninstall_report_warns_about_failed_files_and_leftovers() {
+        let report = install::UninstallReport {
+            files_removed: 9,
+            failed_count: 2,
+            metadata_removed: true,
+            install_dir_removed: false,
+            leftover_entries: 3,
+            launcher_unregistered: true,
+            ..Default::default()
+        };
+
+        let (text, tone) =
+            format_uninstall_report(&report, "Brotato", Path::new("D:/Games/Brotato"), false);
+
+        assert_eq!(tone, 2);
+        assert!(text.contains("2 个文件未能删除"));
+        assert!(text.contains("安装目录仍在（3 项未列入清单）"));
+    }
+
+    #[test]
+    fn partial_uninstall_report_reads_as_cleanup() {
+        let report = install::UninstallReport {
+            files_removed: 5,
+            metadata_removed: true,
+            install_dir_removed: true,
+            launcher_unregistered: true,
+            ..Default::default()
+        };
+
+        let (text, tone) =
+            format_uninstall_report(&report, "Brotato", Path::new("D:/Games/Brotato"), true);
+
+        assert_eq!(tone, 1);
+        assert!(text.contains("已清理《Brotato》的未完成安装"));
     }
 }
