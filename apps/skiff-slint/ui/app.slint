@@ -1,17 +1,21 @@
 // Epic game library downloader — desktop UI (Slint).
 //
 // Presentation only: protocol/download decisions live in `skiff-core`, and `main.rs` owns the
-// state mirrored into these properties. The window has three pages (library / downloads /
-// settings), a collapsible add-on panel, and a detail drawer opened by selecting a game.
+// state mirrored into these properties.
 //
-// The library keeps the two-section model from the earlier revision: main games are the install
-// unit, while add-ons stay browseable in their own grouped list (an add-on row selects its parent
-// because Epic cannot install an add-on without the base game).
+// Visual & interaction hierarchy (L0 -> L3):
+//   L0  App Shell         Left navigation sidebar (220px) + right fluid workspace canvas.
+//   L1  Workspace         Structured 3-zone pages (header -> sub-toolbar -> body) + sidebar mini
+//                         download monitor when away from the downloads page.
+//   L2  Content Drawer    Right slide-over game detail drawer scoped to the workspace (never
+//                         covers or blocks the sidebar; dismissible via scrim, close, or Esc).
+//   L3  Blocking Modal    Two-step first-run setup wizard with full-window pointer-blocking scrim.
 
-import { LineEdit, ScrollView, Spinner, Switch } from "std-widgets.slint";
+import { LineEdit, ScrollView, Switch } from "std-widgets.slint";
 
-// One row of either library section. `kind` selects the layout:
+// One row of either library sub-view. `kind` selects the layout:
 // 1 = main game, 2 = add-on group label, 3 = owned add-on, 4 = add-on without a main game.
+// `install-status`: 0 = not installed, 1 = installed, 2 = partial / resumable.
 export struct LibraryRow {
     kind: int,
     title: string,
@@ -24,56 +28,86 @@ export struct LibraryRow {
     tone: color,
     initial: string,
     developer: string,
+    install-status: int,
 }
 
 global Theme {
-    out property <color> bg: #090b10;
-    out property <color> sidebar: #0d1016;
-    out property <color> panel: #121821;
-    out property <color> panel-2: #171f2a;
-    out property <color> inset: #0b0f15;
-    out property <color> line: #222b38;
-    out property <color> line-soft: #19212c;
+    // L0 surfaces
+    out property <color> bg: #080a0f;
+    out property <color> sidebar: #0c1017;
+    // L1 surfaces
+    out property <color> panel: #111720;
+    out property <color> panel-2: #161e2b;
+    out property <color> inset: #0a0e14;
+    // L2 / L3 elevated surfaces
+    out property <color> elevated: #151d29;
+    // Borders
+    out property <color> line: #202a38;
+    out property <color> line-soft: #18202c;
+    out property <color> line-strong: #2d3b4e;
+    // Scrims
+    out property <color> scrim-content: #05070a8c;
+    out property <color> scrim-modal: #04060ae0;
+    // Text
     out property <color> text: #eef3fa;
     out property <color> muted: #98a4b6;
     out property <color> dim: #667386;
+    // Semantic accents
     out property <color> accent: #4f8cff;
     out property <color> accent-2: #8b5cf6;
     out property <color> accent-soft: #18253a;
     out property <color> ok: #3ddc97;
+    out property <color> ok-soft: #102e24;
     out property <color> warn: #f0b45a;
+    out property <color> warn-soft: #332712;
     out property <color> err: #f26d78;
+    out property <color> err-soft: #33191d;
 }
 
-// Surface used by every panel.
+// Primary L1 card container.
 component Card inherits Rectangle {
+    vertical-stretch: 0;
     background: Theme.panel;
     border-radius: 16px;
     border-width: 1px;
     border-color: Theme.line;
 }
 
-// Text button with hover feedback; the stock widget styles do not match this palette.
+// Secondary inset surface used for telemetry tiles, info boxes, and nested sections.
+component InsetBox inherits Rectangle {
+    vertical-stretch: 0;
+    background: Theme.panel-2;
+    border-radius: 12px;
+    border-width: 1px;
+    border-color: Theme.line-soft;
+}
+
+// Button with clear primary / secondary / flat / danger hierarchy.
 component AppButton inherits Rectangle {
     in property <string> label;
     in property <bool> primary: false;
     in property <bool> flat: false;
     in property <bool> danger: false;
+    in property <bool> compact: false;
     in property <bool> enabled: true;
     callback clicked;
 
-    height: 36px;
-    border-radius: 10px;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    height: root.compact ? 30px : 36px;
+    border-radius: root.compact ? 8px : 10px;
     border-width: root.primary || root.flat ? 0px : 1px;
-    border-color: root.danger ? #4a262c : Theme.line;
+    border-color: root.danger ? #4f272d : Theme.line;
     opacity: root.enabled ? 1.0 : 0.4;
     background: root.primary ? (ta.has-hover ? #6a9dff : Theme.accent)
-        : root.flat ? (ta.has-hover ? #18202c : transparent)
-        : root.danger ? (ta.has-hover ? #341d22 : #1b2029)
-        : (ta.has-hover ? #202a38 : #171e28);
+        : root.flat ? (ta.has-hover ? #192230 : transparent)
+        : root.danger ? (ta.has-hover ? #3a1d22 : #1e171c)
+        : (ta.has-hover ? #212b3a : #171f2b);
     animate background { duration: 120ms; }
 
     HorizontalLayout {
+        padding-left: root.compact ? 10px : 14px;
+        padding-right: root.compact ? 10px : 14px;
         alignment: center;
         Text {
             text: root.label;
@@ -81,7 +115,7 @@ component AppButton inherits Rectangle {
                 : root.flat ? #8fb6ff
                 : root.danger ? Theme.err
                 : Theme.text;
-            font-size: 13px;
+            font-size: root.compact ? 12px : 13px;
             font-weight: 600;
             horizontal-alignment: center;
             vertical-alignment: center;
@@ -95,44 +129,54 @@ component AppButton inherits Rectangle {
     }
 }
 
-// One label/value pair in the progress grid.
-component Stat inherits VerticalLayout {
-    in property <string> label;
-    in property <string> value;
-    spacing: 2px;
-    Text { text: root.label; color: Theme.dim; font-size: 10px; }
-    Text { text: root.value; color: Theme.text; font-size: 13px; font-weight: 600; overflow: elide; }
-}
-
-// Small pill used for counts, phases and account state.
+// Small semantic pill.
 component Chip inherits Rectangle {
     in property <string> label;
     in property <color> tone: Theme.muted;
+    in property <color> bg: transparent;
     in property <bool> filled: false;
-    height: 21px;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    height: 22px;
     border-radius: 11px;
-    background: root.filled ? root.tone : transparent;
+    background: root.filled ? root.tone : root.bg;
     border-width: root.filled ? 0px : 1px;
     border-color: root.tone;
+
     HorizontalLayout {
         padding-left: 9px;
         padding-right: 9px;
         alignment: center;
-        Text { text: root.label; color: root.filled ? #0c0e12 : root.tone; font-size: 10px; font-weight: 600; }
+        Text {
+            text: root.label;
+            color: root.filled ? #0b0e13 : root.tone;
+            font-size: 10px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
     }
 }
 
-// Download phase pill; `kind` matches the tone mapping used by main.rs.
+// Download phase pill; `kind` matches main.rs phase_kind mapping.
 component PhaseChip inherits Rectangle {
     in property <string> label;
     in property <int> kind;
-    height: 22px;
-    border-radius: 11px;
-    background: root.kind == 1 ? #1b2a44
-        : root.kind == 2 ? #12352a
-        : root.kind == 3 ? #3a1b1e
-        : root.kind == 4 ? #3a2f14
-        : #1a1f27;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    height: 24px;
+    border-radius: 12px;
+    background: root.kind == 1 ? #1b2c48
+        : root.kind == 2 ? Theme.ok-soft
+        : root.kind == 3 ? Theme.err-soft
+        : root.kind == 4 ? Theme.warn-soft
+        : #1a212c;
+    border-width: 1px;
+    border-color: root.kind == 1 ? #2d4b7c
+        : root.kind == 2 ? #205c45
+        : root.kind == 3 ? #5c272e
+        : root.kind == 4 ? #5c461d
+        : Theme.line;
+
     HorizontalLayout {
         padding-left: 10px;
         padding-right: 10px;
@@ -144,22 +188,208 @@ component PhaseChip inherits Rectangle {
                 : root.kind == 3 ? Theme.err
                 : root.kind == 4 ? Theme.warn
                 : Theme.muted;
-            font-size: 10px;
+            font-size: 11px;
             font-weight: 600;
+            vertical-alignment: center;
         }
     }
 }
 
+// Local install state badge shared by cards and detail drawer.
+component InstallStatusBadge inherits Rectangle {
+    in property <int> status; // 1 = installed, 2 = partial
+    in property <bool> overlay: false;
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    width: badge-row.preferred-width;
+    height: 21px;
+    border-radius: 10px;
+    background: root.status == 1 ? (root.overlay ? #0a1f18eb : Theme.ok-soft)
+        : (root.overlay ? #2b1e0ceb : Theme.warn-soft);
+    border-width: 1px;
+    border-color: root.status == 1 ? #297a5b : #7c5b24;
+
+    badge-row := HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 5px;
+        alignment: center;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 5px;
+                height: 5px;
+                border-radius: 3px;
+                background: root.status == 1 ? Theme.ok : Theme.warn;
+            }
+        }
+        Text {
+            text: root.status == 1 ? "已安装" : "可续传";
+            color: root.status == 1 ? Theme.ok : Theme.warn;
+            font-size: 10px;
+            font-weight: 700;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// Segmented tab button inside a recessed track.
+component SegmentedItem inherits Rectangle {
+    in property <string> label;
+    in property <string> count: "";
+    in property <bool> active: false;
+    callback clicked;
+
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    height: 30px;
+    border-radius: 8px;
+    background: root.active ? Theme.panel-2 : (ta.has-hover ? #131a25 : transparent);
+    border-width: root.active ? 1px : 0px;
+    border-color: Theme.line-strong;
+    animate background { duration: 100ms; }
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 6px;
+        alignment: center;
+        Text {
+            text: root.label;
+            color: root.active ? Theme.text : Theme.muted;
+            font-size: 12px;
+            font-weight: root.active ? 700 : 500;
+            vertical-alignment: center;
+        }
+        if root.count != "" : Text {
+            text: root.count;
+            color: root.active ? Theme.accent : Theme.dim;
+            font-size: 11px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// Quick filter or preset pill button.
+component FilterPill inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: false;
+    callback clicked;
+
+    horizontal-stretch: 0;
+    vertical-stretch: 0;
+    height: 28px;
+    border-radius: 14px;
+    background: root.active ? Theme.accent-soft : (ta.has-hover ? #161e2b : Theme.panel);
+    border-width: 1px;
+    border-color: root.active ? Theme.accent : Theme.line;
+    animate background { duration: 100ms; }
+    animate border-color { duration: 100ms; }
+
+    HorizontalLayout {
+        padding-left: 11px;
+        padding-right: 11px;
+        alignment: center;
+        Text {
+            text: root.label;
+            color: root.active ? #9cc0ff : Theme.muted;
+            font-size: 11px;
+            font-weight: root.active ? 700 : 500;
+            vertical-alignment: center;
+        }
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// Individual telemetry card used on the Downloads page.
+component MetricTile inherits InsetBox {
+    in property <string> label;
+    in property <string> value;
+    in property <bool> highlight: false;
+    height: 64px;
+
+    VerticalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        padding-top: 10px;
+        padding-bottom: 10px;
+        spacing: 4px;
+        alignment: center;
+
+        Text {
+            text: root.label;
+            color: Theme.dim;
+            font-size: 10px;
+            font-weight: 600;
+        }
+        Text {
+            text: root.value;
+            color: root.highlight ? #9cc0ff : Theme.text;
+            font-size: 15px;
+            font-weight: 700;
+            overflow: elide;
+        }
+    }
+}
+
+// Status banner for notices, warnings, and errors.
+component NoticeBanner inherits Rectangle {
+    in property <string> text;
+    in property <int> tone: 0; // 0 = info, 1 = ok, 2 = warn, 3 = err
+
+    vertical-stretch: 0;
+    border-radius: 10px;
+    border-width: 1px;
+    background: root.tone == 1 ? Theme.ok-soft
+        : root.tone == 2 ? Theme.warn-soft
+        : root.tone == 3 ? Theme.err-soft
+        : #141f31;
+    border-color: root.tone == 1 ? #235c46
+        : root.tone == 2 ? #5e471e
+        : root.tone == 3 ? #5e272e
+        : #24395a;
+
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        padding-top: 10px;
+        padding-bottom: 10px;
+        Text {
+            text: root.text;
+            color: root.tone == 1 ? Theme.ok
+                : root.tone == 2 ? Theme.warn
+                : root.tone == 3 ? Theme.err
+                : #9cc0ff;
+            font-size: 11px;
+            vertical-alignment: center;
+            wrap: word-wrap;
+        }
+    }
+}
+
+// Navigation entry in the left sidebar.
 component NavItem inherits Rectangle {
     in property <string> label;
     in property <int> index;
     in property <int> current;
-    in property <string> badge;
+    in property <string> badge: "";
+    in property <int> badge-tone: 0; // 0 = muted, 1 = accent, 2 = warn
     callback picked;
 
     height: 42px;
+    vertical-stretch: 0;
     border-radius: 10px;
-    background: ta.has-hover ? #151c26 : (root.index == root.current ? Theme.accent-soft : transparent);
+    background: root.index == root.current ? Theme.accent-soft : (ta.has-hover ? #141c28 : transparent);
     animate background { duration: 120ms; }
 
     Rectangle {
@@ -173,39 +403,42 @@ component NavItem inherits Rectangle {
 
     HorizontalLayout {
         padding-left: 14px;
-        padding-right: 12px;
+        padding-right: 10px;
         spacing: 10px;
-        alignment: center;
 
-        Rectangle {
+        VerticalLayout {
+            alignment: center;
             width: 16px;
-            height: 16px;
-            background: transparent;
-
-            // Library: a 2×2 shelf.
-            if root.index == 0 : Rectangle {
-                Rectangle { x: 1px; y: 1px; width: 6px; height: 6px; border-radius: 2px; background: root.index == root.current ? Theme.accent : Theme.muted; }
-                Rectangle { x: 9px; y: 1px; width: 6px; height: 6px; border-radius: 2px; background: root.index == root.current ? Theme.accent : Theme.muted; }
-                Rectangle { x: 1px; y: 9px; width: 6px; height: 6px; border-radius: 2px; background: root.index == root.current ? Theme.accent : Theme.muted; }
-                Rectangle { x: 9px; y: 9px; width: 6px; height: 6px; border-radius: 2px; background: root.index == root.current ? Theme.accent : Theme.muted; }
-            }
-            // Downloads: a down arrow.
-            if root.index == 1 : Path {
+            Rectangle {
                 width: 16px;
                 height: 16px;
-                stroke: root.index == root.current ? Theme.accent : Theme.muted;
-                stroke-width: 1.7px;
-                fill: transparent;
-                commands: "M 8 1 L 8 12 M 3 7 L 8 12 L 13 7";
-            }
-            // Settings: three sliders.
-            if root.index == 2 : Rectangle {
-                Rectangle { x: 1px; y: 3px; width: 14px; height: 1.5px; background: root.index == root.current ? Theme.accent : Theme.muted; }
-                Rectangle { x: 4px; y: 1px; width: 4px; height: 4px; border-radius: 2px; background: root.index == root.current ? Theme.accent : Theme.muted; }
-                Rectangle { x: 1px; y: 8px; width: 14px; height: 1.5px; background: root.index == root.current ? Theme.accent : Theme.muted; }
-                Rectangle { x: 9px; y: 6px; width: 4px; height: 4px; border-radius: 2px; background: root.index == root.current ? Theme.accent : Theme.muted; }
-                Rectangle { x: 1px; y: 13px; width: 14px; height: 1.5px; background: root.index == root.current ? Theme.accent : Theme.muted; }
-                Rectangle { x: 6px; y: 11px; width: 4px; height: 4px; border-radius: 2px; background: root.index == root.current ? Theme.accent : Theme.muted; }
+                background: transparent;
+
+                // Library: 2x2 shelf.
+                if root.index == 0 : Rectangle {
+                    Rectangle { x: 1px; y: 1px; width: 6px; height: 6px; border-radius: 2px; background: root.index == root.current ? Theme.accent : Theme.muted; }
+                    Rectangle { x: 9px; y: 1px; width: 6px; height: 6px; border-radius: 2px; background: root.index == root.current ? Theme.accent : Theme.muted; }
+                    Rectangle { x: 1px; y: 9px; width: 6px; height: 6px; border-radius: 2px; background: root.index == root.current ? Theme.accent : Theme.muted; }
+                    Rectangle { x: 9px; y: 9px; width: 6px; height: 6px; border-radius: 2px; background: root.index == root.current ? Theme.accent : Theme.muted; }
+                }
+                // Downloads: down arrow.
+                if root.index == 1 : Path {
+                    width: 16px;
+                    height: 16px;
+                    stroke: root.index == root.current ? Theme.accent : Theme.muted;
+                    stroke-width: 1.7px;
+                    fill: transparent;
+                    commands: "M 8 1 L 8 12 M 3 7 L 8 12 L 13 7";
+                }
+                // Settings: three sliders.
+                if root.index == 2 : Rectangle {
+                    Rectangle { x: 1px; y: 3px; width: 14px; height: 1.5px; background: root.index == root.current ? Theme.accent : Theme.muted; }
+                    Rectangle { x: 4px; y: 1px; width: 4px; height: 4px; border-radius: 2px; background: root.index == root.current ? Theme.accent : Theme.muted; }
+                    Rectangle { x: 1px; y: 8px; width: 14px; height: 1.5px; background: root.index == root.current ? Theme.accent : Theme.muted; }
+                    Rectangle { x: 9px; y: 6px; width: 4px; height: 4px; border-radius: 2px; background: root.index == root.current ? Theme.accent : Theme.muted; }
+                    Rectangle { x: 1px; y: 13px; width: 14px; height: 1.5px; background: root.index == root.current ? Theme.accent : Theme.muted; }
+                    Rectangle { x: 6px; y: 11px; width: 4px; height: 4px; border-radius: 2px; background: root.index == root.current ? Theme.accent : Theme.muted; }
+                }
             }
         }
 
@@ -214,24 +447,154 @@ component NavItem inherits Rectangle {
             color: root.index == root.current ? Theme.text : Theme.muted;
             font-size: 13px;
             font-weight: root.index == root.current ? 600 : 500;
+            horizontal-alignment: left;
             vertical-alignment: center;
             horizontal-stretch: 1;
+            min-width: 0px;
+            overflow: elide;
         }
-    }
 
-    if root.badge != "" : Text {
-        x: parent.width - self.width - 12px;
-        y: (parent.height - self.height) / 2;
-        text: root.badge;
-        color: Theme.accent;
-        font-size: 10px;
-        font-weight: 700;
-        horizontal-alignment: right;
+        if root.badge != "" : VerticalLayout {
+            alignment: center;
+            Rectangle {
+                height: 20px;
+                border-radius: 10px;
+                background: root.badge-tone == 1 ? #1d355c
+                    : root.badge-tone == 2 ? Theme.warn-soft
+                    : #19212d;
+                HorizontalLayout {
+                    padding-left: 7px;
+                    padding-right: 7px;
+                    alignment: center;
+                    Text {
+                        text: root.badge;
+                        color: root.badge-tone == 1 ? #9cc0ff
+                            : root.badge-tone == 2 ? Theme.warn
+                            : Theme.dim;
+                        font-size: 10px;
+                        font-weight: 700;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+        }
     }
 
     ta := TouchArea {
         mouse-cursor: pointer;
         clicked => { root.picked(); }
+    }
+}
+
+// Compact cross-page download monitor pinned in the sidebar when user is outside Downloads.
+component MiniDownloadCard inherits Rectangle {
+    in property <string> title;
+    in property <string> phase;
+    in property <string> percent-text;
+    in property <string> speed;
+    in property <float> progress;
+    in property <bool> running;
+    in property <bool> indeterminate;
+    in property <float> pulse;
+    in property <image> cover-image;
+    in property <bool> has-cover;
+    in property <color> tone;
+    in property <string> initial;
+    callback open-downloads;
+
+    border-radius: 12px;
+    background: ta.has-hover ? #182334 : Theme.panel-2;
+    border-width: 1px;
+    border-color: root.running ? #2d4c7e : #5c461d;
+    animate background { duration: 120ms; }
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 8px;
+
+        HorizontalLayout {
+            spacing: 8px;
+            Rectangle {
+                width: 28px;
+                height: 36px;
+                border-radius: 6px;
+                clip: true;
+                background: root.tone;
+                if root.has-cover : Image {
+                    width: 100%;
+                    height: 100%;
+                    source: root.cover-image;
+                    image-fit: cover;
+                }
+                if !root.has-cover : Text {
+                    text: root.initial;
+                    color: #ffffffc8;
+                    font-size: 13px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+            VerticalLayout {
+                horizontal-stretch: 1;
+                min-width: 0px;
+                alignment: center;
+                spacing: 2px;
+                Text {
+                    text: root.title;
+                    color: Theme.text;
+                    font-size: 11px;
+                    font-weight: 600;
+                    overflow: elide;
+                }
+                HorizontalLayout {
+                    spacing: 4px;
+                    Text {
+                        text: root.running ? root.percent-text : "已暂停 · " + root.percent-text;
+                        color: root.running ? #9cc0ff : Theme.warn;
+                        font-size: 10px;
+                        font-weight: 700;
+                    }
+                    if root.running && root.speed != "—" : Text {
+                        text: "· " + root.speed;
+                        color: Theme.dim;
+                        font-size: 10px;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            height: 4px;
+            border-radius: 2px;
+            background: Theme.inset;
+            clip: true;
+            if !root.indeterminate : Rectangle {
+                x: 0px;
+                y: 0px;
+                height: 100%;
+                width: parent.width * root.progress;
+                border-radius: 2px;
+                background: root.running
+                    ? @linear-gradient(90deg, #3f7ff0 0%, #7cc0ff 100%)
+                    : Theme.warn;
+                animate width { duration: 220ms; }
+            }
+            if root.indeterminate : Rectangle {
+                y: 0px;
+                height: 100%;
+                width: 48px;
+                x: (parent.width - 48px) * root.pulse;
+                background: @linear-gradient(90deg, transparent 0%, #4c8dff 50%, transparent 100%);
+            }
+        }
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.open-downloads(); }
     }
 }
 
@@ -241,31 +604,58 @@ component Sidebar inherits Rectangle {
     in property <string> account-name;
     in property <string> account-initial;
     in property <string> account-id;
+    in property <bool> library-loaded;
+    in property <int> base-count;
+    in property <bool> job-started;
     in property <bool> job-running;
+    in property <bool> job-can-resume;
+    in property <string> job-title;
+    in property <string> phase;
     in property <string> percent-text;
+    in property <string> speed;
+    in property <float> progress;
+    in property <bool> indeterminate;
+    in property <float> pulse;
+    in property <image> job-cover;
+    in property <bool> job-has-cover;
+    in property <color> job-tone;
+    in property <string> job-initial;
     callback navigate(int);
 
-    width: 216px;
+    width: 220px;
     background: Theme.sidebar;
+
+    // Crisp right divider separating L0 sidebar from L1 workspace.
+    Rectangle {
+        x: parent.width - 1px;
+        y: 0px;
+        width: 1px;
+        height: 100%;
+        background: Theme.line-soft;
+    }
 
     VerticalLayout {
         padding: 16px;
-        spacing: 16px;
+        spacing: 14px;
 
+        // Brand mark
         HorizontalLayout {
             spacing: 10px;
-            Rectangle {
-                width: 34px;
-                height: 34px;
-                border-radius: 11px;
-                background: @linear-gradient(135deg, #5b9dff 0%, #7c5cff 100%);
-                Text {
-                    text: "S";
-                    color: #ffffff;
-                    font-size: 18px;
-                    font-weight: 700;
-                    horizontal-alignment: center;
-                    vertical-alignment: center;
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 34px;
+                    height: 34px;
+                    border-radius: 11px;
+                    background: @linear-gradient(135deg, #5b9dff 0%, #7c5cff 100%);
+                    Text {
+                        text: "S";
+                        color: #ffffff;
+                        font-size: 18px;
+                        font-weight: 700;
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                    }
                 }
             }
             VerticalLayout {
@@ -278,7 +668,7 @@ component Sidebar inherits Rectangle {
 
         Rectangle { height: 1px; background: Theme.line-soft; }
 
-        Text { text: "导航"; color: Theme.dim; font-size: 10px; font-weight: 600; }
+        Text { text: "导航"; color: Theme.dim; font-size: 10px; font-weight: 700; }
 
         VerticalLayout {
             spacing: 4px;
@@ -286,68 +676,110 @@ component Sidebar inherits Rectangle {
                 label: "游戏库";
                 index: 0;
                 current: root.page;
+                badge: root.library-loaded ? root.base-count + "" : "";
+                badge-tone: 0;
                 picked => { root.navigate(0); }
             }
             NavItem {
                 label: "下载";
                 index: 1;
                 current: root.page;
-                badge: root.job-running ? root.percent-text : "";
+                badge: root.job-running ? root.percent-text : (root.job-can-resume ? "已暂停" : "");
+                badge-tone: root.job-running ? 1 : (root.job-can-resume ? 2 : 0);
                 picked => { root.navigate(1); }
             }
             NavItem {
                 label: "设置";
                 index: 2;
                 current: root.page;
+                badge: !root.logged-in ? "未登录" : "";
+                badge-tone: 2;
                 picked => { root.navigate(2); }
             }
         }
 
         Rectangle { vertical-stretch: 1; background: transparent; }
 
+        // Global mini download widget when user navigates away from Downloads.
+        if root.page != 1 && root.job-started && (root.job-running || root.job-can-resume) : MiniDownloadCard {
+            title: root.job-title;
+            phase: root.phase;
+            percent-text: root.percent-text;
+            speed: root.speed;
+            progress: root.progress;
+            running: root.job-running;
+            indeterminate: root.indeterminate;
+            pulse: root.pulse;
+            cover-image: root.job-cover;
+            has-cover: root.job-has-cover;
+            tone: root.job-tone;
+            initial: root.job-initial;
+            open-downloads => { root.navigate(1); }
+        }
+
+        // Account profile card (clicks to Settings).
         Rectangle {
-            height: 62px;
+            height: 60px;
+            vertical-stretch: 0;
             border-radius: 12px;
-            background: Theme.panel;
+            background: acc-ta.has-hover ? Theme.panel-2 : Theme.panel;
             border-width: 1px;
             border-color: Theme.line;
+            animate background { duration: 120ms; }
 
             HorizontalLayout {
                 padding-left: 10px;
                 padding-right: 10px;
                 spacing: 9px;
-                alignment: center;
 
-                Rectangle {
-                    width: 32px;
-                    height: 32px;
-                    border-radius: 16px;
-                    background: root.logged-in ? #24405f : #202632;
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 32px;
+                        height: 32px;
+                        border-radius: 16px;
+                        background: root.logged-in ? #24405f : #202632;
+                        Text {
+                            text: root.account-initial;
+                            color: root.logged-in ? #cfe2ff : Theme.muted;
+                            font-size: 13px;
+                            font-weight: 700;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    min-width: 0px;
+                    alignment: center;
+                    spacing: 1px;
                     Text {
-                        text: root.account-initial;
-                        color: root.logged-in ? #cfe2ff : Theme.muted;
-                        font-size: 13px;
-                        font-weight: 700;
-                        horizontal-alignment: center;
-                        vertical-alignment: center;
+                        text: root.logged-in ? root.account-name : "未登录";
+                        color: Theme.text;
+                        font-size: 12px;
+                        font-weight: 600;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: root.account-id;
+                        color: Theme.dim;
+                        font-size: 9px;
+                        overflow: elide;
                     }
                 }
                 VerticalLayout {
                     alignment: center;
-                    spacing: 1px;
-                    Text { text: root.logged-in ? root.account-name : "未登录"; color: Theme.text; font-size: 12px; font-weight: 600; overflow: elide; }
-                    Text { text: root.account-id; color: Theme.dim; font-size: 9px; overflow: elide; }
-                }
-                Rectangle { horizontal-stretch: 1; background: transparent; }
-                Rectangle {
-                    width: 7px;
-                    height: 7px;
-                    border-radius: 4px;
-                    background: root.logged-in ? Theme.ok : Theme.dim;
+                    Rectangle {
+                        width: 7px;
+                        height: 7px;
+                        border-radius: 4px;
+                        background: root.logged-in ? Theme.ok : Theme.dim;
+                    }
                 }
             }
 
-            TouchArea {
+            acc-ta := TouchArea {
                 mouse-cursor: pointer;
                 clicked => { root.navigate(2); }
             }
@@ -357,6 +789,7 @@ component Sidebar inherits Rectangle {
     }
 }
 
+// Fluid-width portrait game card preserving exact 3:4 cover art proportion.
 component GameCard inherits Rectangle {
     in property <string> title;
     in property <string> sub;
@@ -367,23 +800,27 @@ component GameCard inherits Rectangle {
     in property <color> tone;
     in property <string> initial;
     in property <string> developer;
+    in property <int> install-status: 0;
     in property <bool> selected;
+    in property <length> card-width: 188px;
     callback picked;
 
-    width: 190px;
-    height: 320px;
-    border-radius: 16px;
+    property <length> cover-height: root.card-width * 4 / 3;
+
+    width: root.card-width;
+    height: root.cover-height + 62px;
+    border-radius: 14px;
     clip: true;
-    border-width: 1px;
-    border-color: root.selected ? Theme.accent : (ta.has-hover ? #31405a : Theme.line);
-    background: root.selected ? #17243a : (ta.has-hover ? #151d29 : Theme.panel);
+    border-width: root.selected ? 2px : 1px;
+    border-color: root.selected ? Theme.accent : (ta.has-hover ? #354764 : Theme.line);
+    background: root.selected ? #17243a : (ta.has-hover ? #151e2b : Theme.panel);
     animate background { duration: 120ms; }
     animate border-color { duration: 120ms; }
 
     VerticalLayout {
-        // ---- cover ----
+        // ---- cover (exact 3:4) ----
         Rectangle {
-            height: 253px;
+            height: root.cover-height;
             background: root.tone;
             clip: true;
 
@@ -396,44 +833,76 @@ component GameCard inherits Rectangle {
             if !root.has-cover : Text {
                 text: root.initial;
                 color: #ffffffb8;
-                font-size: 44px;
+                font-size: 42px;
                 font-weight: 700;
                 horizontal-alignment: center;
                 vertical-alignment: center;
             }
 
-            // Soft bottom vignette keeps the badge readable over bright art.
+            // Subtle bottom vignette for crisp transition into the metadata footer.
             Rectangle {
-                y: parent.height - 64px;
+                y: parent.height - 56px;
                 width: 100%;
-                height: 64px;
-                background: @linear-gradient(180deg, #00000000 0%, #00000055 100%);
+                height: 56px;
+                background: @linear-gradient(180deg, #00000000 0%, #00000066 100%);
             }
 
-            if root.badge != "" : Rectangle {
-                x: parent.width - self.width - 9px;
-                y: 9px;
-                height: 21px;
-                border-radius: 11px;
-                background: #080b10cc;
-                border-width: 1px;
-                border-color: #ffffff26;
-                HorizontalLayout {
-                    padding-left: 8px;
-                    padding-right: 8px;
+            // Top overlay strip: left = local install status, right = owned DLC count.
+            if root.install-status > 0 || root.badge != "" : HorizontalLayout {
+                x: 8px;
+                y: 8px;
+                width: parent.width - 16px;
+                height: 22px;
+                spacing: 6px;
+
+                if root.install-status > 0 : VerticalLayout {
                     alignment: center;
-                    Text { text: root.badge; color: #ffffff; font-size: 9px; font-weight: 700; }
+                    InstallStatusBadge {
+                        status: root.install-status;
+                        overlay: true;
+                    }
+                }
+
+                Rectangle { horizontal-stretch: 1; background: transparent; }
+
+                if root.badge != "" : VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        horizontal-stretch: 0;
+                        vertical-stretch: 0;
+                        width: dlc-badge-row.preferred-width;
+                        height: 21px;
+                        border-radius: 10px;
+                        background: #080b10e0;
+                        border-width: 1px;
+                        border-color: #ffffff28;
+                        dlc-badge-row := HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            alignment: center;
+                            Text {
+                                text: root.badge;
+                                color: #eef3fa;
+                                font-size: 9px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        // ---- text ----
+        // ---- card footer ----
         VerticalLayout {
+            height: 62px;
             padding-left: 11px;
             padding-right: 11px;
-            padding-top: 8px;
-            padding-bottom: 10px;
-            spacing: 2px;
+            padding-top: 9px;
+            padding-bottom: 9px;
+            alignment: center;
+            spacing: 3px;
+
             Text {
                 text: root.title;
                 color: Theme.text;
@@ -456,13 +925,12 @@ component GameCard inherits Rectangle {
     }
 }
 
-// One compact row of the add-on panel. Main-game rows use GameCard instead.
-component LibraryEntry inherits Rectangle {
+// Spacious row for the dedicated full-width Add-ons sub-view.
+component AddonListRow inherits Rectangle {
     in property <int> kind: 2;
     in property <string> title;
     in property <string> sub;
     in property <string> badge;
-    /// Main game app name this row activates; empty for labels and orphan rows.
     in property <string> app;
     in property <bool> selectable: true;
     in property <bool> group-selected: false;
@@ -470,75 +938,116 @@ component LibraryEntry inherits Rectangle {
     in property <bool> has-cover;
     in property <color> tone: #202938;
     in property <string> initial: "?";
+    in property <string> developer: "";
     callback picked;
 
-    height: root.kind == 2 ? 30px : 46px;
-    background: root.kind >= 3 && root.group-selected ? #151d29
-        : (ta.has-hover && root.selectable ? #141b25 : transparent);
+    height: root.kind == 2 ? 40px : 60px;
+    border-radius: root.kind == 2 ? 8px : 12px;
+    background: root.kind == 2
+        ? (ta.has-hover && root.selectable ? #141c28 : transparent)
+        : (root.group-selected ? #17243a : (ta.has-hover && root.selectable ? Theme.panel-2 : Theme.panel));
+    border-width: root.kind == 2 ? 0px : 1px;
+    border-color: root.group-selected ? Theme.accent : Theme.line-soft;
     animate background { duration: 100ms; }
 
-    // Add-on group label.
+    // Parent game group header.
     if root.kind == 2 : HorizontalLayout {
-        padding-left: 4px;
-        padding-right: 4px;
-        spacing: 6px;
-        alignment: center;
+        padding-left: 6px;
+        padding-right: 6px;
+        padding-top: 8px;
+        spacing: 8px;
+
         Text {
             text: root.title;
-            color: Theme.muted;
-            font-size: 10px;
+            color: Theme.text;
+            font-size: 13px;
             font-weight: 700;
+            vertical-alignment: center;
             overflow: elide;
-            horizontal-stretch: 1;
         }
-        Text { text: root.sub; color: Theme.dim; font-size: 9px; }
+        VerticalLayout {
+            alignment: center;
+            Chip {
+                label: root.sub;
+                tone: Theme.dim;
+                bg: Theme.panel;
+            }
+        }
+        Rectangle { horizontal-stretch: 1; background: transparent; }
+        if root.selectable : Text {
+            text: "查看主游戏 →";
+            color: ta.has-hover ? #9cc0ff : Theme.accent;
+            font-size: 11px;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
     }
 
-    // Add-on row: thumbnail + title + app name + optional warning.
+    // Add-on item card row.
     if root.kind >= 3 : HorizontalLayout {
-        padding-left: 4px;
-        padding-right: 4px;
-        spacing: 8px;
-        alignment: center;
+        padding-left: 12px;
+        padding-right: 14px;
+        spacing: 12px;
 
-        Rectangle {
-            width: 26px;
-            height: 35px;
-            border-radius: 5px;
-            clip: true;
-            background: root.tone;
-            if root.has-cover : Image {
-                width: 100%;
-                height: 100%;
-                source: root.cover-image;
-                image-fit: cover;
-            }
-            if !root.has-cover : Text {
-                text: root.initial;
-                color: #ffffffb8;
-                font-size: 12px;
-                font-weight: 700;
-                horizontal-alignment: center;
-                vertical-alignment: center;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 32px;
+                height: 42px;
+                border-radius: 6px;
+                clip: true;
+                background: root.tone;
+                if root.has-cover : Image {
+                    width: 100%;
+                    height: 100%;
+                    source: root.cover-image;
+                    image-fit: cover;
+                }
+                if !root.has-cover : Text {
+                    text: root.initial;
+                    color: #ffffffb8;
+                    font-size: 14px;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
             }
         }
 
         VerticalLayout {
-            vertical-stretch: 1;
+            horizontal-stretch: 1;
+            min-width: 0px;
             alignment: center;
-            spacing: 0px;
+            spacing: 2px;
             Text {
                 text: root.title;
                 color: root.kind == 4 ? Theme.muted : Theme.text;
-                font-size: 12px;
-                font-weight: 500;
+                font-size: 13px;
+                font-weight: 600;
                 overflow: elide;
             }
-            Text { text: root.sub; color: Theme.dim; font-size: 9px; overflow: elide; }
+            Text {
+                text: root.developer != "" ? root.developer + " · " + root.sub : root.sub;
+                color: Theme.dim;
+                font-size: 10px;
+                overflow: elide;
+            }
         }
 
-        Rectangle { horizontal-stretch: 1; background: transparent; }
-        if root.badge != "" : Chip { label: root.badge; tone: Theme.warn; }
+        if root.badge != "" : VerticalLayout {
+            alignment: center;
+            Chip {
+                label: root.badge;
+                tone: Theme.warn;
+                bg: Theme.warn-soft;
+            }
+        }
+        if root.kind == 3 : Text {
+            text: "随主游戏安装";
+            color: Theme.dim;
+            font-size: 10px;
+            vertical-alignment: center;
+        }
     }
 
     ta := TouchArea {
@@ -548,175 +1057,174 @@ component LibraryEntry inherits Rectangle {
     }
 }
 
-// The shared configuration form. Used both by the first-run dialog and by 设置.
-component ConfigForm inherits VerticalLayout {
-    in property <string> account-name: "未连接";
-    in property <string> account-id: "";
-    in property <string> account-initial: "?";
-    in property <bool> logged-in: false;
+// Reusable account authorization sub-form (used in Settings when expanded & Setup Step 1).
+component AuthCodeForm inherits VerticalLayout {
     in-out property <string> auth-url: "";
     in-out property <string> code-input: "";
     in property <string> login-error: "";
     in property <bool> login-busy: false;
-    in-out property <string> install-root: "";
-    in-out property <string> concurrency-text: "";
-    in-out property <bool> register-launcher: false;
-    in property <string> note: "";
-    in property <bool> note-error: false;
-    in property <bool> show-launcher-toggle: true;
-
+    in property <bool> logged-in: false;
     callback open-auth-url();
     callback submit-code(string);
 
     spacing: 10px;
 
-    // ---- account ---------------------------------------------------------
-    Text { text: "账号"; color: Theme.dim; font-size: 10px; font-weight: 700; }
-
-    HorizontalLayout {
-        spacing: 11px;
-        Rectangle {
-            width: 40px;
-            height: 40px;
-            border-radius: 20px;
-            background: root.logged-in ? #24405f : #202632;
-            border-width: 1px;
-            border-color: root.logged-in ? #315a85 : Theme.line;
-            Text {
-                text: root.account-initial;
-                color: root.logged-in ? #cfe2ff : Theme.muted;
-                font-size: 15px;
-                font-weight: 700;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
-        }
-        VerticalLayout {
-            alignment: center;
-            spacing: 2px;
-            Text { text: root.account-name; color: Theme.text; font-size: 14px; font-weight: 600; overflow: elide; }
-            Text { text: root.account-id; color: Theme.dim; font-size: 10px; overflow: elide; }
-        }
-        Rectangle { horizontal-stretch: 1; background: transparent; }
-        if root.logged-in : Chip { label: "已连接"; tone: Theme.ok; }
-        if !root.logged-in : Chip { label: "未连接"; tone: Theme.dim; }
-    }
-
     HorizontalLayout {
         spacing: 8px;
         LineEdit {
+            height: 36px;
             text: root.auth-url;
             read-only: true;
             min-width: 0px;
+            horizontal-stretch: 1;
         }
         AppButton {
             label: "打开授权页";
-            width: 96px;
+            width: 104px;
             clicked => { root.open-auth-url(); }
         }
     }
 
     Text {
-        text: "登录后浏览器会显示一段 JSON，复制其中的 authorizationCode 粘贴到下方即可。";
+        text: "在浏览器登录 Epic 后会显示一段 JSON，复制其中的 authorizationCode（或整段 JSON）粘贴到下方提交。";
         color: Theme.dim;
-        font-size: 10px;
+        font-size: 11px;
         wrap: word-wrap;
-    }
-
-    LineEdit {
-        text: root.code-input;
-        placeholder-text: "粘贴 authorizationCode 或整段 JSON，回车提交";
-        edited(t) => { root.code-input = t; }
-        accepted(t) => { root.submit-code(t); }
     }
 
     HorizontalLayout {
-        vertical-stretch: 0;
-        spacing: 10px;
+        spacing: 8px;
+        LineEdit {
+            height: 36px;
+            text: root.code-input;
+            placeholder-text: "粘贴 authorizationCode 或整段 JSON，回车提交";
+            min-width: 0px;
+            horizontal-stretch: 1;
+            edited(t) => { root.code-input = t; }
+            accepted(t) => { root.submit-code(t); }
+        }
         AppButton {
             label: root.login-busy ? "验证中…" : "提交授权码";
             primary: true;
-            width: 118px;
+            width: 114px;
             enabled: !root.login-busy;
             clicked => { root.submit-code(root.code-input); }
         }
-        if root.logged-in && root.login-error == "" : Text {
-            text: "当前账号已连接，提交新授权码会切换账号。";
+    }
+
+    if root.login-error != "" : NoticeBanner {
+        text: root.login-error;
+        tone: 3;
+    }
+}
+
+// Reusable install & concurrency fields (used in Settings Card 2 & Setup Step 2).
+component InstallPrefsFields inherits VerticalLayout {
+    in-out property <string> install-root: "";
+    in-out property <string> concurrency-text: "16";
+
+    spacing: 14px;
+
+    VerticalLayout {
+        spacing: 6px;
+        Text { text: "安装根目录"; color: Theme.muted; font-size: 12px; font-weight: 600; }
+        LineEdit {
+            height: 36px;
+            text: root.install-root;
+            placeholder-text: "例如 D:/Games；留空使用默认目录";
+            edited(t) => { root.install-root = t; }
+        }
+        Text {
+            text: "新安装的游戏会在该目录下按游戏文件夹名自动创建子目录。";
             color: Theme.dim;
             font-size: 10px;
-            vertical-alignment: center;
-            overflow: elide;
         }
     }
 
-    if root.login-error != "" : Text {
-        vertical-stretch: 0;
-        text: root.login-error;
-        color: Theme.err;
-        font-size: 10px;
-        wrap: word-wrap;
-    }
-
-    Rectangle { height: 1px; background: Theme.line-soft; }
-
-    // ---- install preferences --------------------------------------------
-    Text { text: "安装与下载"; color: Theme.dim; font-size: 10px; font-weight: 700; }
-
-    Text { text: "安装根目录"; color: Theme.muted; font-size: 11px; }
-    LineEdit {
-        text: root.install-root;
-        placeholder-text: "例如 D:/Games；留空使用默认目录";
-        edited(t) => { root.install-root = t; }
-    }
-
-    Text { text: "并发线程（1–128）"; color: Theme.muted; font-size: 11px; }
-    LineEdit {
-        text: root.concurrency-text;
-        placeholder-text: "16";
-        edited(t) => { root.concurrency-text = t; }
-    }
-    Text {
-        text: "并发是硬约束：稳态在途请求数恰好等于该值，引擎不会自行增减。";
-        color: Theme.dim;
-        font-size: 10px;
-        wrap: word-wrap;
-    }
-
-    if root.show-launcher-toggle : Switch {
-        text: "安装后注册到 Epic 官方启动器";
-        checked <=> root.register-launcher;
-    }
-    if root.show-launcher-toggle && root.register-launcher : Text {
-        text: "注册后要把 Epic 启动器从托盘完全退出（只关窗口不算）再打开，游戏才会出现在库里。";
-        color: Theme.dim;
-        font-size: 10px;
-        wrap: word-wrap;
-    }
-
-    if root.note != "" : Text {
-        text: root.note;
-        color: root.note-error ? Theme.err : Theme.ok;
-        font-size: 10px;
-        wrap: word-wrap;
+    VerticalLayout {
+        spacing: 6px;
+        HorizontalLayout {
+            spacing: 8px;
+            Text {
+                text: "下载并发线程（1–128）";
+                color: Theme.muted;
+                font-size: 12px;
+                font-weight: 600;
+                vertical-alignment: center;
+            }
+            Rectangle { horizontal-stretch: 1; background: transparent; }
+            Text { text: "推荐预设："; color: Theme.dim; font-size: 10px; vertical-alignment: center; }
+            VerticalLayout {
+                alignment: center;
+                HorizontalLayout {
+                    spacing: 6px;
+                    FilterPill {
+                        label: "8";
+                        active: root.concurrency-text == "8";
+                        clicked => { root.concurrency-text = "8"; }
+                    }
+                    FilterPill {
+                        label: "16";
+                        active: root.concurrency-text == "16";
+                        clicked => { root.concurrency-text = "16"; }
+                    }
+                    FilterPill {
+                        label: "32";
+                        active: root.concurrency-text == "32";
+                        clicked => { root.concurrency-text = "32"; }
+                    }
+                    FilterPill {
+                        label: "64";
+                        active: root.concurrency-text == "64";
+                        clicked => { root.concurrency-text = "64"; }
+                    }
+                }
+            }
+        }
+        LineEdit {
+            height: 36px;
+            text: root.concurrency-text;
+            placeholder-text: "16";
+            edited(t) => { root.concurrency-text = t; }
+        }
+        Text {
+            text: "并发是硬约束：稳态在途请求数恰好等于该值，下载引擎不会自行增减。";
+            color: Theme.dim;
+            font-size: 10px;
+            wrap: word-wrap;
+        }
     }
 }
 
 export component AppWindow inherits Window {
     title: root.page == 0 ? "Skiff · 游戏库" : root.page == 1 ? "Skiff · 下载" : "Skiff · 设置";
     icon: @image-url("icon.png");
-    width: 1280px;
-    height: 840px;
+    min-width: 960px;
+    min-height: 660px;
+    preferred-width: 1280px;
+    preferred-height: 840px;
     background: Theme.bg;
     default-font-family: "Microsoft YaHei UI";
 
-    // ---- navigation ------------------------------------------------------
+    // ---- layout metrics --------------------------------------------------
+    property <length> sidebar-width: 220px;
+    property <length> grid-gap: 16px;
+    property <length> grid-avail-width: max(360px, root.width - root.sidebar-width - 56px - 16px);
+    property <int> grid-columns: root.grid-avail-width >= 1340px ? 7
+        : root.grid-avail-width >= 1140px ? 6
+        : root.grid-avail-width >= 930px ? 5
+        : root.grid-avail-width >= 720px ? 4
+        : root.grid-avail-width >= 510px ? 3
+        : 2;
+    property <length> card-width: (root.grid-avail-width - (root.grid-columns - 1) * root.grid-gap) / root.grid-columns;
+
+    // ---- navigation & view state -----------------------------------------
     in-out property <int> page: 0;
+    in-out property <int> library-tab: 0;      // 0 = main games, 1 = add-ons
+    in-out property <int> library-filter: 0;   // 0 = all, 1 = installed/partial, 2 = with DLC
     in-out property <bool> detail-open: false;
-    in-out property <bool> addons-open: true;
-    // Grid column count follows the window width and whether the add-on panel is showing.
-    in property <int> grid-columns: root.has-addons && root.addons-open
-        ? (root.width >= 1390px ? 4 : root.width >= 1180px ? 3 : 2)
-        : (root.width >= 1400px ? 5 : root.width >= 1080px ? 4 : 3);
+    in-out property <bool> account-edit-open: false;
+    in-out property <int> setup-step: 0;       // 0 = account auth, 1 = install prefs
 
     // ---- account ---------------------------------------------------------
     in property <string> account-name: "未登录";
@@ -727,6 +1235,10 @@ export component AppWindow inherits Window {
     // ---- library ---------------------------------------------------------
     in property <[LibraryRow]> main-rows: [];
     in property <[LibraryRow]> addon-rows: [];
+    in property <int> base-count: 0;
+    in property <int> addon-total-count: 0;
+    in property <int> installed-count: 0;
+    in property <int> with-dlc-count: 0;
     in property <string> main-count-text: "0 款";
     in property <string> addon-count-text: "0 个";
     in property <bool> library-loaded: false;
@@ -766,7 +1278,7 @@ export component AppWindow inherits Window {
     in property <string> note: "";
     in property <bool> note-error: false;
 
-    // ---- selection -------------------------------------------------------
+    // ---- selection / detail drawer ---------------------------------------
     in property <string> selected-title: "";
     in property <string> selected-app: "";
     in property <string> selected-developer: "";
@@ -779,8 +1291,10 @@ export component AppWindow inherits Window {
     in property <string> selected-dlc-text: "";
     in-out property <bool> include-dlc: true;
     in property <bool> can-resume: false;
+    in property <int> selected-install-status: 0;
+    in property <string> detail-error: "";
 
-    // ---- dialogs / form --------------------------------------------------
+    // ---- dialogs / settings form -----------------------------------------
     in-out property <bool> setup-open: false;
     in-out property <string> auth-url: "";
     in-out property <string> code-input: "";
@@ -793,12 +1307,13 @@ export component AppWindow inherits Window {
     in property <bool> config-note-error: false;
     in property <string> setup-note: "";
 
-    // Sweeps the indeterminate bar; advanced by the timer in main.rs.
+    // Sweeps the indeterminate progress bar; advanced by the timer in main.rs.
     in-out property <float> pulse: 0.0;
 
     callback select(string);
     callback refresh();
     callback filter-games(string);
+    callback set-library-filter(int);
     callback install();
     callback pause();
     callback resume-job();
@@ -808,113 +1323,230 @@ export component AppWindow inherits Window {
     callback login-code-submit(string);
     callback open-auth-url();
 
-    HorizontalLayout {
-        Sidebar {
-            page: root.page;
-            logged-in: root.logged-in;
-            account-name: root.account-name;
-            account-initial: root.account-initial;
-            account-id: root.account-id;
-            job-running: root.job-running;
-            percent-text: root.percent-text;
-            navigate(p) => {
-                root.page = p;
+    FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if event.text == Key.Escape && root.detail-open && !root.setup-open {
                 root.detail-open = false;
+                return accept;
             }
+            reject
         }
 
-        Rectangle {
-            horizontal-stretch: 1;
-            background: Theme.bg;
+        // ================= L0: APP SHELL =================
+        HorizontalLayout {
+            width: 100%;
+            height: 100%;
 
-            VerticalLayout {
-                width: 100%;
+            Sidebar {
+                page: root.page;
+                logged-in: root.logged-in;
+                account-name: root.account-name;
+                account-initial: root.account-initial;
+                account-id: root.account-id;
+                library-loaded: root.library-loaded;
+                base-count: root.base-count;
+                job-started: root.job-started;
+                job-running: root.job-running;
+                job-can-resume: root.job-can-resume;
+                job-title: root.job-title;
+                phase: root.phase;
+                percent-text: root.percent-text;
+                speed: root.speed;
+                progress: root.progress;
+                indeterminate: root.indeterminate;
+                pulse: root.pulse;
+                job-cover: root.job-cover;
+                job-has-cover: root.job-has-cover;
+                job-tone: root.job-tone;
+                job-initial: root.job-initial;
+                navigate(p) => {
+                    root.page = p;
+                    root.detail-open = false;
+                }
+            }
+
+            // ================= L1: MAIN WORKSPACE =================
+            Rectangle {
                 horizontal-stretch: 1;
+                vertical-stretch: 1;
+                background: Theme.bg;
+                clip: true;
 
-                // ================= 游戏库 =================
+                // ---------- PAGE 0: 游戏库 ----------
                 if root.page == 0 : VerticalLayout {
-                    width: root.width - 216px;
-                    horizontal-stretch: 1;
-                    padding-left: 26px;
-                    padding-right: 26px;
+                    width: 100%;
+                    height: 100%;
+                    padding-left: 28px;
+                    padding-right: 28px;
                     padding-top: 22px;
-                    padding-bottom: 20px;
+                    padding-bottom: 18px;
                     spacing: 14px;
 
+                    // Zone 1: Page Header
                     HorizontalLayout {
-                        width: 100%;
-                        horizontal-stretch: 1;
                         spacing: 12px;
                         VerticalLayout {
                             alignment: center;
-                            spacing: 1px;
+                            spacing: 2px;
                             Text { text: "游戏库"; color: Theme.text; font-size: 22px; font-weight: 700; }
                             Text { text: root.games-count-text; color: Theme.dim; font-size: 11px; }
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
 
-                        LineEdit {
-                            width: 270px;
-                            horizontal-stretch: 0;
-                            text: root.search-text;
-                            placeholder-text: "搜索游戏、AppName…";
-                            edited(t) => { root.search-text = t; root.filter-games(t); }
+                        VerticalLayout {
+                            alignment: center;
+                            HorizontalLayout {
+                                spacing: 6px;
+                                LineEdit {
+                                    width: 268px;
+                                    height: 36px;
+                                    text: root.search-text;
+                                    placeholder-text: "搜索游戏、DLC 或 AppName…";
+                                    edited(t) => { root.search-text = t; root.filter-games(t); }
+                                }
+                                if root.search-text != "" : VerticalLayout {
+                                    alignment: center;
+                                    AppButton {
+                                        label: "清空";
+                                        flat: true;
+                                        compact: true;
+                                        width: 52px;
+                                        clicked => {
+                                            root.search-text = "";
+                                            root.filter-games("");
+                                        }
+                                    }
+                                }
+                            }
                         }
-                        if root.has-addons : AppButton {
-                            label: root.addons-open ? "隐藏附加内容" : "显示附加内容";
-                            width: 112px;
-                            flat: true;
-                            clicked => { root.addons-open = !root.addons-open; }
-                        }
-                        AppButton {
-                            label: root.refresh-busy ? "刷新中…" : "刷新库";
-                            primary: true;
-                            width: 92px;
-                            enabled: !root.refresh-busy;
-                            clicked => { root.refresh(); }
+
+                        VerticalLayout {
+                            alignment: center;
+                            AppButton {
+                                label: root.refresh-busy ? "刷新中…" : "刷新库";
+                                primary: true;
+                                width: 96px;
+                                enabled: !root.refresh-busy;
+                                clicked => { root.refresh(); }
+                            }
                         }
                     }
 
-                    if root.refresh-busy : Rectangle {
-                        height: 4px;
-                        border-radius: 2px;
-                        background: Theme.inset;
-                        Rectangle {
-                            x: 0px;
-                            y: 0px;
-                            height: 100%;
-                            width: parent.width * root.refresh-progress;
-                            border-radius: 2px;
-                            background: @linear-gradient(90deg, #3f7ff0 0%, #6fb0ff 100%);
-                            animate width { duration: 220ms; }
-                        }
-                    }
-                    if root.refresh-detail != "" : Text {
-                        text: root.refresh-detail;
-                        color: root.refresh-kind == 1 ? Theme.ok : root.refresh-kind == 2 ? Theme.err : Theme.muted;
-                        font-size: 10px;
-                        overflow: elide;
-                    }
-
+                    // Zone 2: Sub-View Switcher & Quick Filter Toolbar
                     HorizontalLayout {
+                        spacing: 12px;
+
+                        // Sub-view segmented switcher (Main Games / Add-ons)
+                        Rectangle {
+                            height: 36px;
+                            horizontal-stretch: 0;
+                            vertical-stretch: 0;
+                            border-radius: 10px;
+                            background: Theme.inset;
+                            border-width: 1px;
+                            border-color: Theme.line-soft;
+
+                            HorizontalLayout {
+                                padding: 3px;
+                                spacing: 4px;
+                                SegmentedItem {
+                                    label: "主游戏";
+                                    count: root.library-loaded ? root.main-count-text : "";
+                                    active: root.library-tab == 0 || !root.has-addons;
+                                    clicked => { root.library-tab = 0; }
+                                }
+                                if root.has-addons : SegmentedItem {
+                                    label: "附加内容";
+                                    count: root.addon-count-text;
+                                    active: root.library-tab == 1;
+                                    clicked => { root.library-tab = 1; }
+                                }
+                            }
+                        }
+
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+
+                        // Quick status filters (applicable to Main Games view)
+                        if root.library-loaded && (root.library-tab == 0 || !root.has-addons) : VerticalLayout {
+                            alignment: center;
+                            HorizontalLayout {
+                                spacing: 6px;
+                                FilterPill {
+                                    label: "全部 (" + root.base-count + ")";
+                                    active: root.library-filter == 0;
+                                    clicked => {
+                                        root.library-filter = 0;
+                                        root.set-library-filter(0);
+                                    }
+                                }
+                                FilterPill {
+                                    label: "已安装 (" + root.installed-count + ")";
+                                    active: root.library-filter == 1;
+                                    clicked => {
+                                        root.library-filter = 1;
+                                        root.set-library-filter(1);
+                                    }
+                                }
+                                if root.has-addons : FilterPill {
+                                    label: "含附加内容 (" + root.with-dlc-count + ")";
+                                    active: root.library-filter == 2;
+                                    clicked => {
+                                        root.library-filter = 2;
+                                        root.set-library-filter(2);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Refresh progress / status strip
+                    if root.refresh-busy || root.refresh-detail != "" : VerticalLayout {
+                        spacing: 5px;
+                        if root.refresh-busy : Rectangle {
+                            height: 4px;
+                            border-radius: 2px;
+                            background: Theme.inset;
+                            clip: true;
+                            Rectangle {
+                                x: 0px;
+                                y: 0px;
+                                height: 100%;
+                                width: parent.width * root.refresh-progress;
+                                border-radius: 2px;
+                                background: @linear-gradient(90deg, #3f7ff0 0%, #7cc0ff 100%);
+                                animate width { duration: 220ms; }
+                            }
+                        }
+                        if root.refresh-detail != "" : Text {
+                            text: root.refresh-detail;
+                            color: root.refresh-kind == 1 ? Theme.ok
+                                : root.refresh-kind == 2 ? Theme.err
+                                : Theme.muted;
+                            font-size: 11px;
+                            overflow: elide;
+                        }
+                    }
+
+                    // Zone 3: Scrollable Content Body
+                    ScrollView {
+                        horizontal-stretch: 1;
                         vertical-stretch: 1;
-                        spacing: 16px;
 
-                        // ---- cover grid ----
-                        ScrollView {
-                            horizontal-stretch: 1;
-                            vertical-stretch: 1;
+                        VerticalLayout {
+                            width: root.grid-avail-width;
+                            spacing: 14px;
 
-                            VerticalLayout {
-                                width: 100%;
-                                spacing: 14px;
-
-                                if root.library-loaded : GridLayout {
-                                    width: 100%;
-                                    spacing: 14px;
+                            // ---- Sub-view 0: Full-width Main Game Cover Grid ----
+                            if root.library-loaded && (root.library-tab == 0 || !root.has-addons) && root.main-rows.length > 0 : HorizontalLayout {
+                                alignment: start;
+                                GridLayout {
+                                    spacing: root.grid-gap;
                                     for r[i] in root.main-rows : GameCard {
                                         col: Math.mod(i, root.grid-columns);
                                         row: i / root.grid-columns;
+                                        card-width: root.card-width;
                                         title: r.title;
                                         sub: r.sub;
                                         badge: r.badge;
@@ -924,55 +1556,129 @@ export component AppWindow inherits Window {
                                         tone: r.tone;
                                         initial: r.initial;
                                         developer: r.developer;
-                                        selected: r.app == root.selected-app;
+                                        install-status: r.install-status;
+                                        selected: r.app == root.selected-app && root.detail-open;
                                         picked => {
                                             root.select(r.app);
                                             root.detail-open = true;
                                         }
                                     }
                                 }
+                            }
 
-                                if root.library-loaded && root.main-rows.length == 0 : Rectangle {
-                                    horizontal-stretch: 1;
-                                    height: 180px;
-                                    background: transparent;
-                                    VerticalLayout {
-                                        horizontal-stretch: 1;
-                                        cross-axis-alignment: center;
+                            // ---- Empty match state for Main Games ----
+                            if root.library-loaded && (root.library-tab == 0 || !root.has-addons) && root.main-rows.length == 0 : Rectangle {
+                                height: 220px;
+                                background: transparent;
+                                VerticalLayout {
+                                    alignment: center;
+                                    spacing: 8px;
+                                    Text {
+                                        text: root.library-filter == 1 ? "当前目录下还没有已安装的游戏"
+                                            : root.library-filter == 2 ? "没有含附加内容的匹配游戏"
+                                            : "没有匹配的游戏";
+                                        color: Theme.muted;
+                                        font-size: 15px;
+                                        font-weight: 600;
+                                        horizontal-alignment: center;
+                                    }
+                                    Text {
+                                        text: "尝试切换筛选条件、清空搜索关键词，或刷新游戏库。";
+                                        color: Theme.dim;
+                                        font-size: 11px;
+                                        horizontal-alignment: center;
+                                    }
+                                    if root.library-filter != 0 || root.search-text != "" : HorizontalLayout {
                                         alignment: center;
-                                        spacing: 4px;
-                                        Text { text: "没有匹配的游戏"; color: Theme.muted; font-size: 14px; horizontal-alignment: center; }
-                                        Text { text: "换个关键词试试，或刷新游戏库。"; color: Theme.dim; font-size: 11px; horizontal-alignment: center; }
+                                        AppButton {
+                                            label: "重置筛选";
+                                            compact: true;
+                                            clicked => {
+                                                root.library-filter = 0;
+                                                root.set-library-filter(0);
+                                                root.search-text = "";
+                                                root.filter-games("");
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            // ---- Sub-view 1: Full-width Grouped Add-ons View ----
+                            if root.library-loaded && root.has-addons && root.library-tab == 1 : VerticalLayout {
+                                spacing: 8px;
+
+                                NoticeBanner {
+                                    text: "附加内容（DLC）不能脱离本体单独安装；点击任意条目或分组头可打开所属主游戏详情。";
+                                    tone: 0;
+                                }
+
+                                if root.addon-rows.length > 0 : VerticalLayout {
+                                    spacing: 6px;
+                                    for r in root.addon-rows : AddonListRow {
+                                        kind: r.kind;
+                                        title: r.title;
+                                        sub: r.sub;
+                                        badge: r.badge;
+                                        app: r.app;
+                                        selectable: r.selectable;
+                                        group-selected: r.kind >= 3 && r.app == root.selected-app && root.detail-open;
+                                        cover-image: r.cover-image;
+                                        has-cover: r.has-cover;
+                                        tone: r.tone;
+                                        initial: r.initial;
+                                        developer: r.developer;
+                                        picked => {
+                                            if r.app != "" {
+                                                root.select(r.app);
+                                                root.detail-open = true;
+                                            }
+                                        }
                                     }
                                 }
 
-                                if !root.library-loaded : Rectangle {
-                                    horizontal-stretch: 1;
-                                    height: 280px;
+                                if root.addon-rows.length == 0 : Rectangle {
+                                    height: 180px;
                                     background: transparent;
                                     VerticalLayout {
-                                        horizontal-stretch: 1;
-                                        cross-axis-alignment: center;
                                         alignment: center;
-                                        spacing: 8px;
+                                        spacing: 6px;
+                                        Text { text: "没有匹配的附加内容"; color: Theme.muted; font-size: 14px; horizontal-alignment: center; }
+                                        Text { text: "清空搜索关键词可查看全部附加内容。"; color: Theme.dim; font-size: 11px; horizontal-alignment: center; }
+                                    }
+                                }
+                            }
+
+                            // ---- Library not loaded empty state ----
+                            if !root.library-loaded : Rectangle {
+                                height: 320px;
+                                background: transparent;
+                                VerticalLayout {
+                                    alignment: center;
+                                    spacing: 10px;
+                                    HorizontalLayout {
+                                        alignment: center;
                                         Rectangle {
-                                            width: 54px;
-                                            height: 54px;
+                                            width: 58px;
+                                            height: 58px;
                                             border-radius: 16px;
                                             background: Theme.accent-soft;
                                             Text { text: "▤"; color: #8fb6ff; font-size: 24px; horizontal-alignment: center; vertical-alignment: center; }
                                         }
-                                        Text { text: "游戏库还是空的"; color: Theme.text; font-size: 16px; font-weight: 600; horizontal-alignment: center; }
-                                        Text {
-                                            text: root.logged-in ? "点右上角「刷新库」拉取你自己的 Epic 游戏。" : "先在设置里连接 Epic 账号，再刷新游戏库。";
-                                            color: Theme.dim;
-                                            font-size: 11px;
-                                            horizontal-alignment: center;
-                                        }
+                                    }
+                                    Text { text: "游戏库还是空的"; color: Theme.text; font-size: 17px; font-weight: 600; horizontal-alignment: center; }
+                                    Text {
+                                        text: root.logged-in ? "点击右上角「刷新库」拉取你的 Epic 游戏列表。" : "先前往设置连接 Epic 账号，再刷新游戏库。";
+                                        color: Theme.dim;
+                                        font-size: 12px;
+                                        horizontal-alignment: center;
+                                    }
+                                    HorizontalLayout {
+                                        alignment: center;
                                         AppButton {
-                                            label: root.logged-in ? "刷新库" : "去连接账号";
+                                            label: root.logged-in ? "立即刷新库" : "去连接账号";
                                             primary: true;
-                                            width: 120px;
+                                            width: 126px;
                                             clicked => {
                                                 if root.logged-in { root.refresh(); } else { root.page = 2; }
                                             }
@@ -981,580 +1687,983 @@ export component AppWindow inherits Window {
                                 }
                             }
                         }
-
-                        // ---- add-on panel ----
-                        if root.has-addons && root.addons-open : Card {
-                            width: 300px;
-                            VerticalLayout {
-                                padding: 12px;
-                                spacing: 8px;
-
-                                HorizontalLayout {
-                                    spacing: 8px;
-                                    Text { text: "附加内容"; color: Theme.text; font-size: 12px; font-weight: 700; }
-                                    Text { text: root.addon-count-text; color: Theme.dim; font-size: 10px; vertical-alignment: center; }
-                                    Rectangle { horizontal-stretch: 1; background: transparent; }
-                                    AppButton {
-                                        label: "收起";
-                                        width: 46px;
-                                        flat: true;
-                                        clicked => { root.addons-open = false; }
-                                    }
-                                }
-
-                                ScrollView {
-                                    vertical-stretch: 1;
-                                    VerticalLayout {
-                                        for r in root.addon-rows : LibraryEntry {
-                                            kind: r.kind;
-                                            title: r.title;
-                                            sub: r.sub;
-                                            badge: r.badge;
-                                            app: r.app;
-                                            selectable: r.selectable;
-                                            group-selected: r.kind >= 3 && r.app == root.selected-app;
-                                            cover-image: r.cover-image;
-                                            has-cover: r.has-cover;
-                                            tone: r.tone;
-                                            initial: r.initial;
-                                            picked => {
-                                                root.select(r.app);
-                                                root.detail-open = true;
-                                            }
-                                        }
-                                        if root.addon-rows.length == 0 : Rectangle {
-                                            height: 48px;
-                                            background: transparent;
-                                            HorizontalLayout {
-                                                alignment: center;
-                                                Text { text: "没有匹配的附加内容"; color: Theme.dim; font-size: 10px; }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
                     }
                 }
 
-                // ================= 下载 =================
+                // ---------- PAGE 1: 下载 ----------
                 if root.page == 1 : VerticalLayout {
-                    width: root.width - 216px;
-                    horizontal-stretch: 1;
-                    padding-left: 26px;
-                    padding-right: 26px;
+                    width: 100%;
+                    height: 100%;
+                    padding-left: 28px;
+                    padding-right: 28px;
                     padding-top: 22px;
                     padding-bottom: 20px;
-                    spacing: 14px;
+                    spacing: 16px;
 
+                    // Zone 1: Header
                     HorizontalLayout {
-                        width: 100%;
-                        horizontal-stretch: 1;
                         spacing: 12px;
                         VerticalLayout {
                             alignment: center;
-                            spacing: 1px;
+                            spacing: 2px;
                             Text { text: "下载"; color: Theme.text; font-size: 22px; font-weight: 700; }
-                            Text { text: "下载、校验和安装状态都在这里"; color: Theme.dim; font-size: 11px; }
+                            Text { text: "实时进度、分块校验与安装控制中心"; color: Theme.dim; font-size: 11px; }
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
-                        AppButton {
-                            label: "返回游戏库";
-                            width: 96px;
-                            flat: true;
-                            clicked => { root.page = 0; }
-                        }
-                    }
-
-                    if !root.job-started : Rectangle {
-                        horizontal-stretch: 1;
-                        vertical-stretch: 1;
-                        background: transparent;
                         VerticalLayout {
-                            horizontal-stretch: 1;
-                            cross-axis-alignment: center;
                             alignment: center;
-                            spacing: 8px;
-                            Rectangle {
-                                width: 68px;
-                                height: 68px;
-                                border-radius: 20px;
-                                background: Theme.accent-soft;
-                                Text { text: "↓"; color: #8fb6ff; font-size: 30px; horizontal-alignment: center; vertical-alignment: center; }
-                            }
-                            Text { text: "还没有下载任务"; color: Theme.text; font-size: 17px; font-weight: 600; horizontal-alignment: center; }
-                            Text { text: "去游戏库挑一款，点开详情就能开始安装。"; color: Theme.dim; font-size: 11px; horizontal-alignment: center; }
                             AppButton {
-                                label: "去游戏库";
-                                primary: true;
-                                width: 120px;
+                                label: "返回游戏库";
+                                width: 96px;
+                                flat: true;
                                 clicked => { root.page = 0; }
                             }
                         }
                     }
 
-                    if root.job-started : HorizontalLayout {
-                        horizontal-stretch: 1;
+                    // Empty state
+                    if !root.job-started : Rectangle {
                         vertical-stretch: 1;
-                        cross-axis-alignment: center;
-                        Rectangle { horizontal-stretch: 1; background: transparent; }
-
-                        Card {
-                            width: 860px;
-                            vertical-stretch: 0;
-                            VerticalLayout {
-                                padding: 20px;
-                                spacing: 16px;
-
-                                HorizontalLayout {
-                                    spacing: 16px;
-                                    Rectangle {
-                                        width: 112px;
-                                        height: 150px;
-                                        border-radius: 12px;
-                                        clip: true;
-                                        background: root.job-tone;
-                                        if root.job-has-cover : Image {
-                                            width: 100%;
-                                            height: 100%;
-                                            source: root.job-cover;
-                                            image-fit: cover;
-                                        }
-                                        if !root.job-has-cover : Text {
-                                            text: root.job-initial;
-                                            color: #ffffffb8;
-                                            font-size: 30px;
-                                            font-weight: 700;
-                                            horizontal-alignment: center;
-                                            vertical-alignment: center;
-                                        }
-                                    }
-                                    VerticalLayout {
-                                        vertical-stretch: 1;
-                                        spacing: 3px;
-                                        HorizontalLayout {
-                                            spacing: 8px;
-                                            Text {
-                                                text: root.job-title;
-                                                color: Theme.text;
-                                                font-size: 20px;
-                                                font-weight: 700;
-                                                overflow: elide;
-                                                horizontal-stretch: 1;
-                                            }
-                                            PhaseChip { label: root.phase; kind: root.phase-kind; }
-                                        }
-                                        Text { text: root.job-app; color: Theme.dim; font-size: 11px; overflow: elide; }
-                                        Text { text: "安装到 " + root.job-target-dir; color: Theme.dim; font-size: 10px; overflow: elide; }
-                                        Rectangle { vertical-stretch: 1; background: transparent; }
-                                        HorizontalLayout {
-                                            spacing: 8px;
-                                            Text { text: root.percent-text; color: Theme.text; font-size: 38px; font-weight: 700; vertical-alignment: bottom; }
-                                            Rectangle { horizontal-stretch: 1; background: transparent; }
-                                            VerticalLayout {
-                                                alignment: end;
-                                                spacing: 1px;
-                                                Text { text: root.speed; color: Theme.text; font-size: 13px; font-weight: 600; horizontal-alignment: right; }
-                                                Text { text: "剩余 " + root.eta; color: Theme.dim; font-size: 10px; horizontal-alignment: right; }
-                                            }
-                                        }
-                                    }
-                                }
-
+                        background: transparent;
+                        VerticalLayout {
+                            alignment: center;
+                            spacing: 10px;
+                            HorizontalLayout {
+                                alignment: center;
                                 Rectangle {
-                                    height: 12px;
-                                    border-radius: 6px;
-                                    background: Theme.inset;
-                                    border-width: 1px;
-                                    border-color: Theme.line-soft;
-                                    clip: true;
-                                    if !root.indeterminate : Rectangle {
-                                        x: 0px;
-                                        y: 0px;
-                                        height: 100%;
-                                        width: parent.width * root.progress;
-                                        border-radius: 6px;
-                                        background: @linear-gradient(90deg, #3f7ff0 0%, #7cc0ff 100%);
-                                        animate width { duration: 220ms; }
-                                    }
-                                    if root.indeterminate : Rectangle {
-                                        y: 0px;
-                                        height: 100%;
-                                        width: 180px;
-                                        x: (parent.width - 180px) * root.pulse;
-                                        background: @linear-gradient(90deg, transparent 0%, #4c8dff 50%, transparent 100%);
+                                    width: 68px;
+                                    height: 68px;
+                                    border-radius: 20px;
+                                    background: Theme.accent-soft;
+                                    Text { text: "↓"; color: #8fb6ff; font-size: 30px; horizontal-alignment: center; vertical-alignment: center; }
+                                }
+                            }
+                            Text { text: "当前没有下载任务"; color: Theme.text; font-size: 17px; font-weight: 600; horizontal-alignment: center; }
+                            Text { text: "前往游戏库选择任意游戏，打开详情抽屉即可开始高速多线程安装。"; color: Theme.dim; font-size: 12px; horizontal-alignment: center; }
+                            HorizontalLayout {
+                                alignment: center;
+                                AppButton {
+                                    label: "前往游戏库";
+                                    primary: true;
+                                    width: 128px;
+                                    clicked => { root.page = 0; }
+                                }
+                            }
+                        }
+                    }
+
+                    // Active / Paused / Finished Job View (3-tier hierarchy)
+                    if root.job-started : ScrollView {
+                        vertical-stretch: 1;
+
+                        VerticalLayout {
+                            width: root.grid-avail-width;
+                            alignment: start;
+                            padding-bottom: 16px;
+
+                            HorizontalLayout {
+                                alignment: center;
+
+                                VerticalLayout {
+                                    width: min(900px, root.grid-avail-width);
+                                    alignment: start;
+                                    spacing: 14px;
+
+                                    // Tier 1: Hero Task Header + Progress Track
+                                    Card {
+                                        VerticalLayout {
+                                            padding: 20px;
+                                            spacing: 16px;
+
+                                            HorizontalLayout {
+                                                spacing: 18px;
+                                                Rectangle {
+                                                    width: 108px;
+                                                    height: 144px;
+                                                    border-radius: 12px;
+                                                    clip: true;
+                                                    background: root.job-tone;
+                                                    if root.job-has-cover : Image {
+                                                        width: 100%;
+                                                        height: 100%;
+                                                        source: root.job-cover;
+                                                        image-fit: cover;
+                                                    }
+                                                    if !root.job-has-cover : Text {
+                                                        text: root.job-initial;
+                                                        color: #ffffffb8;
+                                                        font-size: 30px;
+                                                        font-weight: 700;
+                                                        horizontal-alignment: center;
+                                                        vertical-alignment: center;
+                                                    }
+                                                }
+
+                                                VerticalLayout {
+                                                    horizontal-stretch: 1;
+                                                    min-width: 0px;
+                                                    spacing: 4px;
+
+                                                    HorizontalLayout {
+                                                        spacing: 10px;
+                                                        Text {
+                                                            text: root.job-title;
+                                                            color: Theme.text;
+                                                            font-size: 20px;
+                                                            font-weight: 700;
+                                                            overflow: elide;
+                                                            horizontal-stretch: 1;
+                                                            min-width: 0px;
+                                                        }
+                                                        VerticalLayout {
+                                                            alignment: center;
+                                                            PhaseChip { label: root.phase; kind: root.phase-kind; }
+                                                        }
+                                                    }
+
+                                                Text { text: root.job-app; color: Theme.dim; font-size: 11px; overflow: elide; }
+                                                Text { text: "安装路径：" + root.job-target-dir; color: Theme.muted; font-size: 11px; overflow: elide; }
+
+                                                Rectangle { vertical-stretch: 1; background: transparent; }
+
+                                                HorizontalLayout {
+                                                    spacing: 12px;
+                                                    Text {
+                                                        text: root.percent-text;
+                                                        color: Theme.text;
+                                                        font-size: 36px;
+                                                        font-weight: 700;
+                                                        vertical-alignment: bottom;
+                                                    }
+                                                    Rectangle { horizontal-stretch: 1; background: transparent; }
+                                                    Text {
+                                                        text: root.indeterminate ? "正在准备构建与节点…" : root.bytes-text;
+                                                        color: Theme.muted;
+                                                        font-size: 12px;
+                                                        font-weight: 600;
+                                                        vertical-alignment: bottom;
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        // Progress Track
+                                        Rectangle {
+                                            height: 12px;
+                                            border-radius: 6px;
+                                            background: Theme.inset;
+                                            border-width: 1px;
+                                            border-color: Theme.line-soft;
+                                            clip: true;
+
+                                            if !root.indeterminate : Rectangle {
+                                                x: 0px;
+                                                y: 0px;
+                                                height: 100%;
+                                                width: parent.width * root.progress;
+                                                border-radius: 6px;
+                                                background: root.phase-kind == 2 ? @linear-gradient(90deg, #27b87d 0%, #52e5a8 100%)
+                                                    : root.phase-kind == 4 ? @linear-gradient(90deg, #c98c32 0%, #f0b45a 100%)
+                                                    : root.phase-kind == 3 ? @linear-gradient(90deg, #c94652 0%, #f26d78 100%)
+                                                    : @linear-gradient(90deg, #3f7ff0 0%, #7cc0ff 100%);
+                                                animate width { duration: 220ms; }
+                                            }
+                                            if root.indeterminate : Rectangle {
+                                                y: 0px;
+                                                height: 100%;
+                                                width: 180px;
+                                                x: (parent.width - 180px) * root.pulse;
+                                                background: @linear-gradient(90deg, transparent 0%, #4c8dff 50%, transparent 100%);
+                                            }
+                                        }
                                     }
                                 }
 
-                                HorizontalLayout {
-                                    spacing: 18px;
-                                    VerticalLayout {
-                                        horizontal-stretch: 1;
-                                        spacing: 8px;
-                                        Stat { label: "已下载"; value: root.bytes-text; }
-                                        Stat { label: "分块"; value: root.chunks-text; }
+                                // Tier 2: Dedicated 6-Tile Telemetry Grid (no duplicate metrics)
+                                GridLayout {
+                                    spacing: 12px;
+                                    Row {
+                                        MetricTile { label: "下载速度"; value: root.speed; highlight: root.job-running; horizontal-stretch: 1; }
+                                        MetricTile { label: "预计剩余"; value: root.eta; horizontal-stretch: 1; }
+                                        MetricTile { label: "已下载 / 总计"; value: root.bytes-text; horizontal-stretch: 1; }
                                     }
-                                    VerticalLayout {
-                                        horizontal-stretch: 1;
-                                        spacing: 8px;
-                                        Stat { label: "速度"; value: root.speed; }
-                                        Stat { label: "剩余时间"; value: root.eta; }
-                                    }
-                                    VerticalLayout {
-                                        horizontal-stretch: 1;
-                                        spacing: 8px;
-                                        Stat { label: "在途 / 峰值"; value: root.inflight-text; }
-                                        Stat { label: "用时"; value: root.elapsed-text; }
+                                    Row {
+                                        MetricTile { label: "分块进度"; value: root.chunks-text; horizontal-stretch: 1; }
+                                        MetricTile { label: "在途 / 峰值并发"; value: root.inflight-text; horizontal-stretch: 1; }
+                                        MetricTile { label: "已用时间"; value: root.elapsed-text; horizontal-stretch: 1; }
                                     }
                                 }
 
-                                if root.retries-text != "" : Text {
+                                // Tier 3: Status Banners + Action Control Bar
+                                if root.retries-text != "" : NoticeBanner {
                                     text: root.retries-text;
-                                    color: Theme.warn;
-                                    font-size: 10px;
+                                    tone: 2;
                                 }
-                                if root.note != "" : Text {
+                                if root.note != "" : NoticeBanner {
                                     text: root.note;
-                                    color: root.note-error ? Theme.err : Theme.ok;
-                                    font-size: 10px;
-                                    wrap: word-wrap;
+                                    tone: root.note-error ? 3 : (root.phase-kind == 2 ? 1 : root.phase-kind == 4 ? 2 : 0);
                                 }
 
-                                HorizontalLayout {
-                                    spacing: 8px;
-                                    if root.job-running : AppButton {
-                                        label: "暂停";
-                                        width: 78px;
-                                        clicked => { root.pause(); }
-                                    }
-                                    if root.job-running : AppButton {
-                                        label: "取消安装";
-                                        width: 96px;
-                                        danger: true;
-                                        clicked => { root.cancel-job(); }
-                                    }
-                                    if !root.job-running && root.job-can-resume : AppButton {
-                                        label: "继续下载";
-                                        primary: true;
-                                        width: 112px;
-                                        clicked => { root.resume-job(); }
-                                    }
-                                    if !root.job-running && root.job-can-resume : AppButton {
-                                        label: "删除未完成文件";
-                                        width: 132px;
-                                        danger: true;
-                                        clicked => { root.cancel-job(); }
-                                    }
-                                    if !root.job-running && !root.job-can-resume : AppButton {
-                                        label: "返回游戏库";
-                                        width: 108px;
-                                        clicked => { root.page = 0; }
+                                Card {
+                                    HorizontalLayout {
+                                        padding-left: 16px;
+                                        padding-right: 16px;
+                                        padding-top: 12px;
+                                        padding-bottom: 12px;
+                                        spacing: 10px;
+
+                                        // Left: destructive / secondary controls
+                                        if root.job-running : AppButton {
+                                            label: "取消安装";
+                                            danger: true;
+                                            clicked => { root.cancel-job(); }
+                                        }
+                                        if !root.job-running && root.job-can-resume : AppButton {
+                                            label: "删除未完成文件";
+                                            danger: true;
+                                            clicked => { root.cancel-job(); }
+                                        }
+
+                                        Rectangle { horizontal-stretch: 1; background: transparent; }
+
+                                        // Right: primary controls
+                                        if root.job-running : AppButton {
+                                            label: "暂停下载";
+                                            width: 108px;
+                                            clicked => { root.pause(); }
+                                        }
+                                        if !root.job-running && root.job-can-resume : AppButton {
+                                            label: "继续下载";
+                                            primary: true;
+                                            width: 120px;
+                                            clicked => { root.resume-job(); }
+                                        }
+                                        if !root.job-running && !root.job-can-resume : AppButton {
+                                            label: "返回游戏库";
+                                            primary: true;
+                                            width: 120px;
+                                            clicked => { root.page = 0; }
+                                        }
                                     }
                                 }
                             }
                         }
-
-                        Rectangle { horizontal-stretch: 1; background: transparent; }
                     }
                 }
+            }
 
-                // ================= 设置 =================
+                // ---------- PAGE 2: 设置 ----------
                 if root.page == 2 : VerticalLayout {
-                    width: root.width - 216px;
-                    horizontal-stretch: 1;
-                    padding-left: 26px;
-                    padding-right: 26px;
+                    width: 100%;
+                    height: 100%;
+                    padding-left: 28px;
+                    padding-right: 28px;
                     padding-top: 22px;
-                    padding-bottom: 20px;
-                    spacing: 14px;
+                    padding-bottom: 18px;
+                    spacing: 16px;
 
+                    // Zone 1: Sticky Header with Save Action
                     HorizontalLayout {
-                        width: 100%;
-                        horizontal-stretch: 1;
                         spacing: 12px;
                         VerticalLayout {
                             alignment: center;
-                            spacing: 1px;
+                            spacing: 2px;
                             Text { text: "设置"; color: Theme.text; font-size: 22px; font-weight: 700; }
-                            Text { text: "账号、安装位置和下载并发"; color: Theme.dim; font-size: 11px; }
+                            Text { text: "账号授权、安装目录、并发控制与启动器集成（保存在 config.toml）"; color: Theme.dim; font-size: 11px; }
                         }
                         Rectangle { horizontal-stretch: 1; background: transparent; }
-                        Text { text: "改动保存在 config.toml 中。"; color: Theme.dim; font-size: 10px; vertical-alignment: center; }
+
+                        if root.config-note != "" : Text {
+                            text: root.config-note;
+                            color: root.config-note-error ? Theme.err : Theme.ok;
+                            font-size: 11px;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                        }
+
+                        VerticalLayout {
+                            alignment: center;
+                            AppButton {
+                                label: "保存设置";
+                                primary: true;
+                                width: 108px;
+                                clicked => { root.save-settings(); }
+                            }
+                        }
                     }
 
+                    // Zone 2: Sectioned Setting Cards
                     ScrollView {
-                        horizontal-stretch: 1;
                         vertical-stretch: 1;
+
                         VerticalLayout {
-                            width: 100%;
+                            width: root.grid-avail-width;
+                            alignment: start;
+                            padding-bottom: 16px;
+
                             HorizontalLayout {
-                                horizontal-stretch: 1;
-                                Rectangle { horizontal-stretch: 1; background: transparent; }
-                                Card {
-                                    width: 760px;
-                                    VerticalLayout {
-                                        padding: 22px;
-                                        spacing: 14px;
-                                        ConfigForm {
-                                            account-name: root.account-name;
-                                            account-id: root.account-id;
-                                            account-initial: root.account-initial;
-                                            logged-in: root.logged-in;
-                                            auth-url <=> root.auth-url;
-                                            code-input <=> root.code-input;
-                                            login-error: root.login-error;
-                                            login-busy: root.login-busy;
-                                            install-root <=> root.install-root;
-                                            concurrency-text <=> root.concurrency-text;
-                                            register-launcher <=> root.register-launcher;
-                                            show-launcher-toggle: true;
-                                            note: root.config-note;
-                                            note-error: root.config-note-error;
-                                            open-auth-url => { root.open-auth-url(); }
-                                            submit-code(code) => { root.login-code-submit(code); }
+                                alignment: center;
+
+                                VerticalLayout {
+                                    width: min(820px, root.grid-avail-width);
+                                    alignment: start;
+                                    spacing: 14px;
+
+                                    // Card 1: Epic Account (progressive disclosure when logged in)
+                                    Card {
+                                        VerticalLayout {
+                                            padding: 20px;
+                                            spacing: 14px;
+
+                                            HorizontalLayout {
+                                                spacing: 12px;
+                                                VerticalLayout {
+                                                    alignment: center;
+                                                    Rectangle {
+                                                        width: 44px;
+                                                        height: 44px;
+                                                        border-radius: 22px;
+                                                        background: root.logged-in ? #24405f : #202632;
+                                                        border-width: 1px;
+                                                        border-color: root.logged-in ? #366494 : Theme.line;
+                                                        Text {
+                                                            text: root.account-initial;
+                                                            color: root.logged-in ? #cfe2ff : Theme.muted;
+                                                            font-size: 16px;
+                                                            font-weight: 700;
+                                                            horizontal-alignment: center;
+                                                            vertical-alignment: center;
+                                                        }
+                                                    }
+                                                }
+                                                VerticalLayout {
+                                                    horizontal-stretch: 1;
+                                                    min-width: 0px;
+                                                    alignment: center;
+                                                    spacing: 3px;
+                                                    HorizontalLayout {
+                                                        alignment: start;
+                                                        spacing: 8px;
+                                                        Text {
+                                                            text: root.account-name;
+                                                            color: Theme.text;
+                                                            font-size: 15px;
+                                                            font-weight: 700;
+                                                            vertical-alignment: center;
+                                                            overflow: elide;
+                                                        }
+                                                        VerticalLayout {
+                                                            alignment: center;
+                                                            if root.logged-in : Chip { label: "已连接"; tone: Theme.ok; bg: Theme.ok-soft; }
+                                                            if !root.logged-in : Chip { label: "未连接"; tone: Theme.warn; bg: Theme.warn-soft; }
+                                                        }
+                                                    }
+                                                    Text {
+                                                        text: root.account-id;
+                                                        color: Theme.dim;
+                                                        font-size: 11px;
+                                                        overflow: elide;
+                                                    }
+                                                }
+                                                if root.logged-in : VerticalLayout {
+                                                    alignment: center;
+                                                    AppButton {
+                                                        label: root.account-edit-open ? "收起授权表单" : "切换账号";
+                                                        compact: true;
+                                                        clicked => { root.account-edit-open = !root.account-edit-open; }
+                                                    }
+                                                }
+                                            }
+
+                                            if !root.logged-in || root.account-edit-open : Rectangle {
+                                                height: 1px;
+                                                background: Theme.line-soft;
+                                            }
+
+                                            if !root.logged-in || root.account-edit-open : AuthCodeForm {
+                                                auth-url <=> root.auth-url;
+                                                code-input <=> root.code-input;
+                                                login-error: root.login-error;
+                                                login-busy: root.login-busy;
+                                                logged-in: root.logged-in;
+                                                open-auth-url => { root.open-auth-url(); }
+                                                submit-code(code) => { root.login-code-submit(code); }
+                                            }
                                         }
-                                        HorizontalLayout {
-                                            spacing: 10px;
-                                            Rectangle { horizontal-stretch: 1; background: transparent; }
-                                            AppButton {
-                                                label: "保存设置";
-                                                primary: true;
-                                                width: 110px;
-                                                clicked => { root.save-settings(); }
+                                    }
+
+                                    // Card 2: Download & Install Preferences
+                                    Card {
+                                        VerticalLayout {
+                                            padding: 20px;
+                                            spacing: 14px;
+
+                                            VerticalLayout {
+                                                spacing: 3px;
+                                                Text { text: "安装与下载"; color: Theme.text; font-size: 14px; font-weight: 700; }
+                                                Text { text: "配置默认安装目录和并发下载线程数"; color: Theme.dim; font-size: 11px; }
+                                            }
+
+                                            Rectangle { height: 1px; background: Theme.line-soft; }
+
+                                            InstallPrefsFields {
+                                                install-root <=> root.install-root;
+                                                concurrency-text <=> root.concurrency-text;
+                                            }
+                                        }
+                                    }
+
+                                    // Card 3: Official Epic Launcher Integration
+                                    Card {
+                                        VerticalLayout {
+                                            padding: 20px;
+                                            spacing: 12px;
+
+                                            HorizontalLayout {
+                                                spacing: 12px;
+                                                VerticalLayout {
+                                                    horizontal-stretch: 1;
+                                                    spacing: 3px;
+                                                    Text { text: "Epic 官方启动器集成"; color: Theme.text; font-size: 14px; font-weight: 700; }
+                                                    Text { text: "安装完成后自动写入清单和 EOSH 记录，让官方启动器直接识别为已安装。"; color: Theme.dim; font-size: 11px; wrap: word-wrap; }
+                                                }
+                                                VerticalLayout {
+                                                    alignment: center;
+                                                    Switch {
+                                                        checked <=> root.register-launcher;
+                                                    }
+                                                }
+                                            }
+
+                                            if root.register-launcher : NoticeBanner {
+                                                text: "提示：若安装时 Epic 启动器正在运行，需右键任务栏托盘图标「完全退出」再重新打开，游戏才会出现在官方库中。";
+                                                tone: 0;
                                             }
                                         }
                                     }
                                 }
-                                Rectangle { horizontal-stretch: 1; background: transparent; }
                             }
                         }
                     }
                 }
             }
         }
-    }
 
-    // ================= 游戏详情抽屉 =================
-    if root.detail-open && root.selected-app != "" : Rectangle {
-        x: 0px;
-        y: 0px;
-        width: 100%;
-        height: 100%;
-        background: #05070ac0;
+        // ================= L2: CONTENT-SCOPED GAME DETAIL DRAWER =================
+        // Scoped strictly to the right workspace (`x: sidebar-width`), leaving Sidebar visible & clickable.
+        if root.detail-open && root.selected-app != "" : Rectangle {
+            x: root.sidebar-width;
+            y: 0px;
+            width: root.width - root.sidebar-width;
+            height: 100%;
+            background: Theme.scrim-content;
 
-        TouchArea {
-            clicked => { root.detail-open = false; }
-        }
+            TouchArea {
+                clicked => { root.detail-open = false; }
+            }
 
-        Rectangle {
-            x: root.width - self.width - 12px;
-            y: 12px;
-            width: 420px;
-            height: root.height - 24px;
-            border-radius: 18px;
-            background: Theme.panel;
-            border-width: 1px;
-            border-color: Theme.line;
+            Rectangle {
+                width: min(440px, parent.width - 28px);
+                height: parent.height - 24px;
+                x: parent.width - self.width - 12px;
+                y: 12px;
+                border-radius: 18px;
+                background: Theme.elevated;
+                border-width: 1px;
+                border-color: Theme.line-strong;
+                drop-shadow-blur: 28px;
+                drop-shadow-color: #00000099;
+                drop-shadow-offset-x: -4px;
+                drop-shadow-offset-y: 8px;
 
-            TouchArea { }
-
-            VerticalLayout {
-                padding: 20px;
-                spacing: 14px;
-
-                HorizontalLayout {
-                    spacing: 8px;
-                    Text { text: "游戏详情"; color: Theme.muted; font-size: 11px; font-weight: 700; vertical-alignment: center; }
-                    Rectangle { horizontal-stretch: 1; background: transparent; }
-                    AppButton {
-                        label: "关闭";
-                        width: 58px;
-                        flat: true;
-                        clicked => { root.detail-open = false; }
-                    }
-                }
-
-                HorizontalLayout {
-                    spacing: 14px;
-                    Rectangle {
-                        width: 140px;
-                        height: 187px;
-                        border-radius: 12px;
-                        clip: true;
-                        background: root.selected-tone;
-                        if root.selected-has-cover : Image {
-                            width: 100%;
-                            height: 100%;
-                            source: root.selected-cover;
-                            image-fit: cover;
-                        }
-                        if !root.selected-has-cover : Text {
-                            text: root.selected-initial;
-                            color: #ffffffb8;
-                            font-size: 36px;
-                            font-weight: 700;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
-                    }
-                    VerticalLayout {
-                        vertical-stretch: 1;
-                        spacing: 3px;
-                        Text { text: root.selected-title; color: Theme.text; font-size: 18px; font-weight: 700; overflow: elide; wrap: word-wrap; }
-                        Text { text: root.selected-developer; color: Theme.muted; font-size: 11px; overflow: elide; }
-                        Text { text: root.selected-app; color: Theme.dim; font-size: 10px; overflow: elide; }
-                        Rectangle { vertical-stretch: 1; background: transparent; }
-                        if root.selected-dlc-count > 0 : Chip { label: "附加内容 " + root.selected-dlc-count; tone: Theme.accent; }
-                    }
-                }
-
-                if root.selected-dlc-count > 0 : VerticalLayout {
-                    spacing: 6px;
-                    Text { text: "包含的附加内容"; color: Theme.dim; font-size: 10px; font-weight: 700; }
-                    ScrollView {
-                        height: 92px;
-                        Text {
-                            text: root.selected-dlc-text;
-                            color: Theme.muted;
-                            font-size: 11px;
-                            wrap: word-wrap;
-                        }
-                    }
-                    Switch {
-                        text: "安装时包含附加内容";
-                        checked <=> root.include-dlc;
-                    }
-                }
-
-                Rectangle {
-                    height: 1px;
-                    background: Theme.line-soft;
-                }
+                // Block click-through on drawer surface.
+                TouchArea { }
 
                 VerticalLayout {
-                    spacing: 3px;
-                    Text { text: "安装到"; color: Theme.dim; font-size: 10px; font-weight: 700; }
-                    Text { text: root.target-dir; color: Theme.muted; font-size: 10px; wrap: word-wrap; }
-                }
+                    width: 100%;
+                    height: 100%;
 
-                if root.note != "" && root.note-error : Text {
-                    text: root.note;
-                    color: Theme.err;
-                    font-size: 10px;
-                    wrap: word-wrap;
-                }
+                    // Drawer Top Header
+                    HorizontalLayout {
+                        padding-left: 20px;
+                        padding-right: 16px;
+                        padding-top: 16px;
+                        padding-bottom: 12px;
+                        spacing: 8px;
 
-                Rectangle { vertical-stretch: 1; background: transparent; }
+                        Text {
+                            text: "游戏详情";
+                            color: Theme.text;
+                            font-size: 14px;
+                            font-weight: 700;
+                            vertical-alignment: center;
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            if root.selected-install-status > 0 : InstallStatusBadge {
+                                status: root.selected-install-status;
+                            }
+                            if root.selected-install-status == 0 : Chip {
+                                label: "未安装";
+                                tone: Theme.dim;
+                                bg: Theme.panel;
+                            }
+                        }
 
-                if root.job-running && root.selected-app == root.job-app : AppButton {
-                    label: "查看下载进度";
-                    primary: true;
-                    clicked => {
-                        root.page = 1;
-                        root.detail-open = false;
+                        Rectangle { horizontal-stretch: 1; background: transparent; }
+
+                        VerticalLayout {
+                            alignment: center;
+                            AppButton {
+                                label: "关闭";
+                                flat: true;
+                                compact: true;
+                                width: 52px;
+                                clicked => { root.detail-open = false; }
+                            }
+                        }
                     }
-                }
-                if root.job-running && root.selected-app != root.job-app : Text {
-                    text: "有下载任务正在进行，完成或暂停后再开始新的安装。";
-                    color: Theme.warn;
-                    font-size: 10px;
-                    wrap: word-wrap;
-                }
-                if !root.job-running : AppButton {
-                    label: root.can-resume ? "继续安装" : "开始安装";
-                    primary: true;
-                    clicked => { root.install(); }
+
+                    Rectangle { height: 1px; background: Theme.line-soft; }
+
+                    // Drawer Scrollable Body
+                    ScrollView {
+                        vertical-stretch: 1;
+
+                        VerticalLayout {
+                            alignment: start;
+                            padding: 20px;
+                            spacing: 16px;
+
+                            // Hero block
+                            HorizontalLayout {
+                                spacing: 14px;
+                                Rectangle {
+                                    width: 120px;
+                                    height: 160px;
+                                    border-radius: 12px;
+                                    clip: true;
+                                    background: root.selected-tone;
+                                    if root.selected-has-cover : Image {
+                                        width: 100%;
+                                        height: 100%;
+                                        source: root.selected-cover;
+                                        image-fit: cover;
+                                    }
+                                    if !root.selected-has-cover : Text {
+                                        text: root.selected-initial;
+                                        color: #ffffffb8;
+                                        font-size: 34px;
+                                        font-weight: 700;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                VerticalLayout {
+                                    horizontal-stretch: 1;
+                                    min-width: 0px;
+                                    spacing: 5px;
+                                    Text {
+                                        text: root.selected-title;
+                                        color: Theme.text;
+                                        font-size: 17px;
+                                        font-weight: 700;
+                                        wrap: word-wrap;
+                                    }
+                                    if root.selected-developer != "" : Text {
+                                        text: root.selected-developer;
+                                        color: Theme.muted;
+                                        font-size: 11px;
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        text: "AppName: " + root.selected-app;
+                                        color: Theme.dim;
+                                        font-size: 10px;
+                                        overflow: elide;
+                                    }
+                                    Rectangle { vertical-stretch: 1; background: transparent; }
+                                    if root.selected-dlc-count > 0 : HorizontalLayout {
+                                        alignment: start;
+                                        Chip {
+                                            label: "包含 " + root.selected-dlc-count + " 个附加内容";
+                                            tone: #9cc0ff;
+                                            bg: Theme.accent-soft;
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Target install location inset card
+                            InsetBox {
+                                VerticalLayout {
+                                    padding: 14px;
+                                    spacing: 5px;
+                                    Text { text: "目标安装路径"; color: Theme.dim; font-size: 10px; font-weight: 700; }
+                                    Text { text: root.target-dir; color: Theme.text; font-size: 11px; wrap: word-wrap; }
+                                    if root.selected-install-status == 1 : Text {
+                                        text: "检测到本地已有完整安装，点击下方按钮可校验完整性并更新。";
+                                        color: Theme.ok;
+                                        font-size: 10px;
+                                        wrap: word-wrap;
+                                    }
+                                    if root.selected-install-status == 2 : Text {
+                                        text: "检测到未完成的下载记录，可从断点直接继续安装。";
+                                        color: Theme.warn;
+                                        font-size: 10px;
+                                        wrap: word-wrap;
+                                    }
+                                }
+                            }
+
+                            // Add-ons section card
+                            if root.selected-dlc-count > 0 : InsetBox {
+                                VerticalLayout {
+                                    padding: 14px;
+                                    spacing: 10px;
+
+                                    HorizontalLayout {
+                                        spacing: 8px;
+                                        Text {
+                                            text: "已拥有的附加内容 (" + root.selected-dlc-count + ")";
+                                            color: Theme.text;
+                                            font-size: 12px;
+                                            font-weight: 700;
+                                            vertical-alignment: center;
+                                        }
+                                        Rectangle { horizontal-stretch: 1; background: transparent; }
+                                    }
+
+                                    Text {
+                                        text: root.selected-dlc-text;
+                                        color: Theme.muted;
+                                        font-size: 11px;
+                                        wrap: word-wrap;
+                                    }
+
+                                    Rectangle { height: 1px; background: Theme.line; }
+
+                                    Switch {
+                                        text: "安装主游戏时一并包含以上附加内容";
+                                        checked <=> root.include-dlc;
+                                    }
+                                }
+                            }
+
+                            if root.detail-error != "" : NoticeBanner {
+                                text: root.detail-error;
+                                tone: 3;
+                            }
+                        }
+                    }
+
+                    Rectangle { height: 1px; background: Theme.line-soft; }
+
+                    // Drawer Sticky Footer Action Bar
+                    VerticalLayout {
+                        padding-left: 20px;
+                        padding-right: 20px;
+                        padding-top: 14px;
+                        padding-bottom: 16px;
+                        spacing: 8px;
+
+                        if root.job-running && root.selected-app == root.job-app : AppButton {
+                            label: "查看当前下载进度";
+                            primary: true;
+                            clicked => {
+                                root.page = 1;
+                                root.detail-open = false;
+                            }
+                        }
+                        if root.job-running && root.selected-app != root.job-app : VerticalLayout {
+                            spacing: 8px;
+                            NoticeBanner {
+                                text: "「" + root.job-title + "」正在下载中，请等待完成或暂停后再开始新任务。";
+                                tone: 2;
+                            }
+                            AppButton {
+                                label: "跳转到下载页";
+                                clicked => {
+                                    root.page = 1;
+                                    root.detail-open = false;
+                                }
+                            }
+                        }
+                        if !root.job-running : AppButton {
+                            label: root.selected-install-status == 2 || root.can-resume ? "继续安装"
+                                : root.selected-install-status == 1 ? "校验并更新"
+                                : "开始安装";
+                            primary: true;
+                            clicked => { root.install(); }
+                        }
+                    }
                 }
             }
         }
-    }
 
-    // ================= first-run 开始配置 =================
-    if root.setup-open : Rectangle {
-        x: 0px;
-        y: 0px;
-        width: 100%;
-        height: 100%;
-        background: #05070ad9;
+        // ================= L3: BLOCKING TWO-STEP SETUP WIZARD =================
+        if root.setup-open : Rectangle {
+            x: 0px;
+            y: 0px;
+            width: 100%;
+            height: 100%;
+            background: Theme.scrim-modal;
 
-        Rectangle {
-            width: 580px;
-            height: min(root.height - 72px, 680px);
-            x: (root.width - self.width) / 2;
-            y: (root.height - self.height) / 2;
-            background: Theme.panel;
-            border-radius: 18px;
-            border-width: 1px;
-            border-color: Theme.line;
-
+            // Explicit full-window scrim TouchArea prevents pointer pass-through to L0/L1/L2.
             TouchArea { }
 
-            VerticalLayout {
-                padding: 24px;
-                spacing: 14px;
+            Rectangle {
+                width: min(580px, root.width - 48px);
+                height: min(root.height - 64px, 560px);
+                x: (root.width - self.width) / 2;
+                y: (root.height - self.height) / 2;
+                background: Theme.elevated;
+                border-radius: 18px;
+                border-width: 1px;
+                border-color: Theme.line-strong;
+                drop-shadow-blur: 36px;
+                drop-shadow-color: #000000cc;
+                drop-shadow-offset-y: 12px;
 
-                HorizontalLayout {
-                    spacing: 10px;
-                    Rectangle {
-                        width: 34px;
-                        height: 34px;
-                        border-radius: 11px;
-                        background: @linear-gradient(135deg, #5b9dff 0%, #7c5cff 100%);
-                        Text {
-                            text: "S";
-                            color: #ffffff;
-                            font-size: 17px;
-                            font-weight: 700;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
+                TouchArea { }
+
+                VerticalLayout {
+                    width: 100%;
+                    height: 100%;
+
+                    // Wizard Header + 2-Step Indicator
+                    VerticalLayout {
+                        padding-left: 24px;
+                        padding-right: 24px;
+                        padding-top: 22px;
+                        padding-bottom: 14px;
+                        spacing: 14px;
+
+                        HorizontalLayout {
+                            spacing: 10px;
+                            Rectangle {
+                                width: 34px;
+                                height: 34px;
+                                border-radius: 11px;
+                                background: @linear-gradient(135deg, #5b9dff 0%, #7c5cff 100%);
+                                Text {
+                                    text: "S";
+                                    color: #ffffff;
+                                    font-size: 17px;
+                                    font-weight: 700;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                spacing: 1px;
+                                Text { text: "欢迎使用 Skiff"; color: Theme.text; font-size: 18px; font-weight: 700; }
+                                Text { text: "两步完成初始化，后续随时可在「设置」中调整。"; color: Theme.dim; font-size: 11px; }
+                            }
+                        }
+
+                        // Step indicator pills
+                        HorizontalLayout {
+                            spacing: 8px;
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                height: 36px;
+                                border-radius: 10px;
+                                background: root.setup-step == 0 ? Theme.accent-soft : Theme.panel;
+                                border-width: 1px;
+                                border-color: root.setup-step == 0 ? Theme.accent : (root.logged-in ? #256149 : Theme.line);
+                                HorizontalLayout {
+                                    padding-left: 12px;
+                                    padding-right: 12px;
+                                    spacing: 8px;
+                                    alignment: center;
+                                    Text {
+                                        text: root.logged-in ? "✓ 1. 连接 Epic 账号" : "1. 连接 Epic 账号";
+                                        color: root.setup-step == 0 ? #9cc0ff : (root.logged-in ? Theme.ok : Theme.muted);
+                                        font-size: 12px;
+                                        font-weight: 700;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                TouchArea {
+                                    mouse-cursor: pointer;
+                                    clicked => { root.setup-step = 0; }
+                                }
+                            }
+                            Rectangle {
+                                horizontal-stretch: 1;
+                                height: 36px;
+                                border-radius: 10px;
+                                background: root.setup-step == 1 ? Theme.accent-soft : Theme.panel;
+                                border-width: 1px;
+                                border-color: root.setup-step == 1 ? Theme.accent : Theme.line;
+                                opacity: root.logged-in ? 1.0 : 0.5;
+                                HorizontalLayout {
+                                    padding-left: 12px;
+                                    padding-right: 12px;
+                                    spacing: 8px;
+                                    alignment: center;
+                                    Text {
+                                        text: "2. 安装与下载设置";
+                                        color: root.setup-step == 1 ? #9cc0ff : Theme.muted;
+                                        font-size: 12px;
+                                        font-weight: 700;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                                TouchArea {
+                                    enabled: root.logged-in;
+                                    mouse-cursor: root.logged-in ? pointer : default;
+                                    clicked => { root.setup-step = 1; }
+                                }
+                            }
                         }
                     }
-                    VerticalLayout {
-                        alignment: center;
-                        spacing: 0px;
-                        Text { text: "开始配置"; color: Theme.text; font-size: 18px; font-weight: 700; }
-                        Text { text: "连接账号、选好安装位置，之后这些选项都在「设置」里。"; color: Theme.dim; font-size: 10px; }
-                    }
-                }
 
-                ScrollView {
-                    vertical-stretch: 1;
-                    ConfigForm {
-                        account-name: root.account-name;
-                        account-id: root.account-id;
-                        account-initial: root.account-initial;
-                        logged-in: root.logged-in;
-                        auth-url <=> root.auth-url;
-                        code-input <=> root.code-input;
-                        login-error: root.login-error;
-                        login-busy: root.login-busy;
-                        install-root <=> root.install-root;
-                        concurrency-text <=> root.concurrency-text;
-                        register-launcher <=> root.register-launcher;
-                        show-launcher-toggle: true;
-                        note: root.setup-note;
-                        note-error: root.config-note-error;
-                        open-auth-url => { root.open-auth-url(); }
-                        submit-code(code) => { root.login-code-submit(code); }
-                    }
-                }
+                    Rectangle { height: 1px; background: Theme.line-soft; }
 
-                HorizontalLayout {
-                    spacing: 10px;
-                    Text {
-                        text: root.logged-in ? "账号已连接，点右侧完成配置。" : "连接账号后才能完成配置。";
-                        color: Theme.dim;
-                        font-size: 10px;
-                        vertical-alignment: center;
-                        horizontal-stretch: 1;
-                        wrap: word-wrap;
+                    // Wizard Step Body
+                    ScrollView {
+                        vertical-stretch: 1;
+
+                        VerticalLayout {
+                            alignment: start;
+                            padding: 24px;
+                            spacing: 14px;
+
+                            // Step 0: Account Connection
+                            if root.setup-step == 0 : VerticalLayout {
+                                alignment: start;
+                                spacing: 14px;
+
+                                InsetBox {
+                                    HorizontalLayout {
+                                        padding: 12px;
+                                        spacing: 10px;
+                                        VerticalLayout {
+                                            alignment: center;
+                                            Rectangle {
+                                                width: 38px;
+                                                height: 38px;
+                                                border-radius: 19px;
+                                                background: root.logged-in ? #24405f : #202632;
+                                                Text {
+                                                    text: root.account-initial;
+                                                    color: root.logged-in ? #cfe2ff : Theme.muted;
+                                                    font-size: 15px;
+                                                    font-weight: 700;
+                                                    horizontal-alignment: center;
+                                                    vertical-alignment: center;
+                                                }
+                                            }
+                                        }
+                                        VerticalLayout {
+                                            horizontal-stretch: 1;
+                                            min-width: 0px;
+                                            alignment: center;
+                                            spacing: 1px;
+                                            Text { text: root.account-name; color: Theme.text; font-size: 14px; font-weight: 600; overflow: elide; }
+                                            Text { text: root.account-id; color: Theme.dim; font-size: 10px; overflow: elide; }
+                                        }
+                                        VerticalLayout {
+                                            alignment: center;
+                                            if root.logged-in : Chip { label: "已连接"; tone: Theme.ok; bg: Theme.ok-soft; }
+                                            if !root.logged-in : Chip { label: "待授权"; tone: Theme.warn; bg: Theme.warn-soft; }
+                                        }
+                                    }
+                                }
+
+                                AuthCodeForm {
+                                    auth-url <=> root.auth-url;
+                                    code-input <=> root.code-input;
+                                    login-error: root.login-error;
+                                    login-busy: root.login-busy;
+                                    logged-in: root.logged-in;
+                                    open-auth-url => { root.open-auth-url(); }
+                                    submit-code(code) => { root.login-code-submit(code); }
+                                }
+
+                                if root.setup-note != "" && !root.config-note-error : NoticeBanner {
+                                    text: root.setup-note;
+                                    tone: 1;
+                                }
+                            }
+
+                            // Step 1: Install Preferences
+                            if root.setup-step == 1 : VerticalLayout {
+                                spacing: 14px;
+
+                                InstallPrefsFields {
+                                    install-root <=> root.install-root;
+                                    concurrency-text <=> root.concurrency-text;
+                                }
+
+                                InsetBox {
+                                    VerticalLayout {
+                                        padding: 12px;
+                                        spacing: 8px;
+                                        Switch {
+                                            text: "安装后注册到 Epic 官方启动器";
+                                            checked <=> root.register-launcher;
+                                        }
+                                        if root.register-launcher : Text {
+                                            text: "注册后需把 Epic 启动器从托盘完全退出再重新打开，游戏才会出现在库中。";
+                                            color: Theme.dim;
+                                            font-size: 10px;
+                                            wrap: word-wrap;
+                                        }
+                                    }
+                                }
+
+                                if root.setup-note != "" && root.config-note-error : NoticeBanner {
+                                    text: root.setup-note;
+                                    tone: 3;
+                                }
+                            }
+                        }
                     }
-                    AppButton {
-                        label: "完成配置";
-                        primary: true;
-                        width: 108px;
-                        enabled: root.logged-in;
-                        clicked => { root.finish-setup(); }
+
+                    Rectangle { height: 1px; background: Theme.line-soft; }
+
+                    // Wizard Footer Navigation
+                    HorizontalLayout {
+                        padding-left: 24px;
+                        padding-right: 24px;
+                        padding-top: 14px;
+                        padding-bottom: 16px;
+                        spacing: 10px;
+
+                        if root.setup-step == 0 : Text {
+                            text: root.logged-in ? "账号已就绪，点击「下一步」设置安装目录。" : "完成账号授权后即可进入下一步。";
+                            color: Theme.dim;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                            horizontal-stretch: 1;
+                            wrap: word-wrap;
+                        }
+                        if root.setup-step == 0 : AppButton {
+                            label: "下一步";
+                            primary: true;
+                            width: 104px;
+                            enabled: root.logged-in;
+                            clicked => { root.setup-step = 1; }
+                        }
+
+                        if root.setup-step == 1 : AppButton {
+                            label: "上一步";
+                            width: 96px;
+                            clicked => { root.setup-step = 0; }
+                        }
+                        if root.setup-step == 1 : Rectangle { horizontal-stretch: 1; background: transparent; }
+                        if root.setup-step == 1 : AppButton {
+                            label: "完成配置";
+                            primary: true;
+                            width: 112px;
+                            enabled: root.logged-in;
+                            clicked => { root.finish-setup(); }
+                        }
                     }
                 }
             }

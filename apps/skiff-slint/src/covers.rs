@@ -1,46 +1,55 @@
-//! Local cover-art cache for the game library.
+//! Local cover-art cache and background thumbnail decoder for the game library.
 //!
-//! Epic's catalog exposes public key images; the desktop UI downloads the tall box art once per
-//! URL and keeps it in `<state>/covers`. Rendering never waits on the network: a missing file is
-//! simply a placeholder until a background worker finishes it, and the UI polls [`generation`] to
-//! know when a new image is available.
+//! Epic's catalog exposes public key images. Although we request `?h=320&resize=1`, some CDN
+//! origins ignore resize query parameters and return full 1200x1600 (2–8 MiB) PNG/JPEG assets.
+//! Decoding >100 full-resolution images synchronously on the UI thread would freeze startup and
+//! consume >1 GiB of RAM.
 //!
-//! Thumbnails are requested from Epic's image CDN with `?h=320&resize=1` (it scales the source by
-//! height), so no local image decoding or scaling is needed and the process keeps no image crate
-//! dependency of its own.
+//! Therefore this module keeps ALL network fetches, disk reads, image decoding, and area-averaged
+//! downscaling (`<= 320px`) on a bounded background worker pool. Decoded thumbnails are also
+//! persisted as tiny raw `.thumb` files so subsequent launches load in milliseconds. The UI
+//! thread only performs O(1) in-memory `SharedPixelBuffer` clones.
 
 use skiff_core::http::{Client, Request};
 use skiff_core::util;
-use slint::Image;
-use std::collections::HashSet;
+use slint::{Image, Rgba8Pixel, SharedPixelBuffer};
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Requested thumbnail height. Portrait box art comes back at about 240×320.
+/// Requested thumbnail height and maximum decoded thumbnail edge in pixels.
 const COVER_HEIGHT: u32 = 320;
-/// Refuse anything larger; cover art is tens of KiB. A misbehaving CDN must not balloon the cache.
-const MAX_COVER_BYTES: usize = 2 * 1024 * 1024;
-/// Concurrent cover downloads. Small enough to stay polite and to avoid a burst of TLS handshakes.
+/// Upper bound for a single cover download. Some Epic CDN nodes ignore resize parameters and return
+/// raw 1200x1600 / 2560x1440 PNGs that exceed 2 MiB.
+const MAX_COVER_BYTES: usize = 12 * 1024 * 1024;
+/// Concurrent cover download / decode workers.
 const WORKERS: usize = 4;
-/// Formats Epic's key-image CDN currently serves (and that Slint's decoders understand). The real
-/// format is detected from the bytes, not from the URL: some catalog images are PNG even though
-/// their path has no extension, and saving those as `.jpg` made the decoder reject them.
+/// Formats Epic's key-image CDN serves (and that Slint's decoders understand).
 const CACHE_EXTENSIONS: [&str; 4] = ["jpg", "png", "webp", "gif"];
+/// Legacy RGB8 thumbnail magic (`SKTH` + u16 width + u16 height + RGB8).
+const THUMB_MAGIC_RGB: &[u8; 4] = b"SKTH";
+/// RGBA8 thumbnail magic (`SKT4` + u16 width + u16 height + RGBA8).
+const THUMB_MAGIC_RGBA: &[u8; 4] = b"SKT4";
 
 /// One process-wide cover store. Clone the [`Arc`], not the struct.
 pub struct CoverLoader {
     dir: PathBuf,
     generation: AtomicU64,
-    /// URLs already queued or finished in this session, so two library refreshes do not duplicate
-    /// work. A failed URL is not retried until the process restarts or a refresh arrives with a
-    /// different URL; that avoids a retry storm when the network is down.
-    seen: Mutex<HashSet<String>>,
-    queue: Mutex<Vec<String>>,
-    /// Cache files whose extension already matched their bytes, so the UI thread does not re-read
-    /// every cover header on each model rebuild.
+    active_workers: AtomicUsize,
+    /// URLs already queued for network download in this session.
+    seen_download: Mutex<HashSet<String>>,
+    /// URLs already queued for background decode in this session.
+    seen_decode: Mutex<HashSet<String>>,
+    /// Local files waiting to be decoded into downscaled thumbnails (drained first).
+    decode_queue: Mutex<Vec<String>>,
+    /// Remote URLs waiting to be downloaded and then decoded.
+    download_queue: Mutex<Vec<String>>,
+    /// Cache files whose extension already matched their bytes.
     validated: Mutex<HashSet<PathBuf>>,
+    /// In-memory decoded & downscaled RGBA8 thumbnails ready for instant UI-thread lookup.
+    decoded: Mutex<HashMap<String, SharedPixelBuffer<Rgba8Pixel>>>,
 }
 
 impl CoverLoader {
@@ -49,15 +58,27 @@ impl CoverLoader {
         CoverLoader {
             dir: dir.into(),
             generation: AtomicU64::new(0),
-            seen: Mutex::new(HashSet::new()),
-            queue: Mutex::new(Vec::new()),
+            active_workers: AtomicUsize::new(0),
+            seen_download: Mutex::new(HashSet::new()),
+            seen_decode: Mutex::new(HashSet::new()),
+            decode_queue: Mutex::new(Vec::new()),
+            download_queue: Mutex::new(Vec::new()),
             validated: Mutex::new(HashSet::new()),
+            decoded: Mutex::new(HashMap::new()),
         }
     }
 
-    /// How many covers have landed since startup. The UI rebuilds rows when this changes.
+    /// Incremented whenever a new decoded thumbnail becomes ready in memory.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
+    }
+
+    /// True once a decoded thumbnail for `url` is available in memory.
+    pub fn is_decoded(&self, url: &str) -> bool {
+        if url.is_empty() {
+            return false;
+        }
+        self.decoded.lock().map(|map| map.contains_key(url)).unwrap_or(false)
     }
 
     /// Cached path for a catalog cover URL, when a valid file is already on disk.
@@ -87,63 +108,151 @@ impl CoverLoader {
         None
     }
 
-    /// Decode a cached cover for the UI thread. Returns `None` while the download is still pending.
+    /// Instant, non-blocking UI-thread lookup of an already decoded thumbnail.
+    ///
+    /// Never performs disk I/O or image decoding on the UI thread.
     pub fn image_for(&self, url: &str) -> Option<Image> {
-        let path = self.cached_path(url)?;
-        Image::load_from_path(&path).ok()
+        if url.is_empty() {
+            return None;
+        }
+        let buffer = self.decoded.lock().ok()?.get(url).cloned()?;
+        Some(Image::from_rgba8(buffer))
     }
 
-    /// Queue every missing URL and start (or top up) the worker pool.
+    /// Queue every URL for background decode (if cached) or download+decode, then ensure workers run.
     ///
-    /// Safe to call from either the UI thread or the library-refresh worker. Calls are cheap when
-    /// everything is already cached.
+    /// Safe and fast to call from either the UI thread or a background refresh worker.
     pub fn request_all(self: &Arc<Self>, urls: impl IntoIterator<Item = String>) {
         if std::fs::create_dir_all(&self.dir).is_err() {
             return;
         }
 
-        let mut queued = 0usize;
-        {
-            let Ok(mut seen) = self.seen.lock() else { return };
-            let Ok(mut queue) = self.queue.lock() else { return };
-            for url in urls {
-                if url.is_empty() || !url.starts_with("https://") {
-                    continue;
+        let mut enqueued = false;
+        for url in urls {
+            if url.is_empty() || !url.starts_with("https://") {
+                continue;
+            }
+            if self.is_decoded(&url) {
+                continue;
+            }
+            // Fast path: if a pre-scaled `.thumb` or cached source file exists, decode in background.
+            if self.thumb_path(&url).is_file() || self.cached_path(&url).is_some() {
+                let is_new = self
+                    .seen_decode
+                    .lock()
+                    .map(|mut set| set.insert(url.clone()))
+                    .unwrap_or(false);
+                if is_new {
+                    if let Ok(mut queue) = self.decode_queue.lock() {
+                        queue.push(url);
+                        enqueued = true;
+                    }
                 }
-                if self.cached_path(&url).is_some() {
-                    continue;
+                continue;
+            }
+            let is_new = self
+                .seen_download
+                .lock()
+                .map(|mut set| set.insert(url.clone()))
+                .unwrap_or(false);
+            if is_new {
+                if let Ok(mut queue) = self.download_queue.lock() {
+                    queue.push(url);
+                    enqueued = true;
                 }
-                if !seen.insert(url.clone()) {
-                    continue;
-                }
-                queue.push(url);
-                queued += 1;
             }
         }
-        if queued == 0 {
+        if !enqueued {
             return;
         }
 
-        for _ in 0..WORKERS {
-            let loader = Arc::clone(self);
-            let _ = std::thread::Builder::new()
-                .name("skiff-cover".to_string())
-                .spawn(move || loader.work());
+        self.ensure_workers();
+    }
+
+    fn ensure_workers(self: &Arc<Self>) {
+        loop {
+            let current = self.active_workers.load(Ordering::Acquire);
+            if current >= WORKERS {
+                break;
+            }
+            if self
+                .active_workers
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                let loader = Arc::clone(self);
+                if std::thread::Builder::new()
+                    .name("skiff-cover".to_string())
+                    .spawn(move || loader.work())
+                    .is_err()
+                {
+                    self.active_workers.fetch_sub(1, Ordering::Release);
+                    break;
+                }
+            }
         }
     }
 
-    /// Consume queued URLs until the queue is empty.
+    /// Consume local decode tasks first (fast), then remote download+decode tasks.
     fn work(&self) {
-        loop {
-            let next = {
-                let Ok(mut queue) = self.queue.lock() else { return };
-                queue.pop()
-            };
-            let Some(url) = next else { return };
-            if self.fetch(&url) {
-                self.generation.fetch_add(1, Ordering::Relaxed);
+        struct WorkerGuard<'a>(&'a AtomicUsize);
+        impl Drop for WorkerGuard<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Release);
             }
         }
+        let _guard = WorkerGuard(&self.active_workers);
+
+        loop {
+            let local_url = self.decode_queue.lock().ok().and_then(|mut q| q.pop());
+            if let Some(url) = local_url {
+                if self.decode_into_memory(&url) {
+                    self.generation.fetch_add(1, Ordering::Relaxed);
+                }
+                continue;
+            }
+
+            let remote_url = self.download_queue.lock().ok().and_then(|mut q| q.pop());
+            if let Some(url) = remote_url {
+                if self.fetch(&url) && self.decode_into_memory(&url) {
+                    self.generation.fetch_add(1, Ordering::Relaxed);
+                }
+                continue;
+            }
+
+            break;
+        }
+    }
+
+    fn decode_into_memory(&self, url: &str) -> bool {
+        if self.is_decoded(url) {
+            return false;
+        }
+        let thumb_path = self.thumb_path(url);
+        if let Some(buf) = read_thumb(&thumb_path) {
+            if let Ok(mut map) = self.decoded.lock() {
+                map.insert(url.to_string(), buf);
+            }
+            return true;
+        }
+
+        let Some(src_path) = self.cached_path(url) else {
+            return false;
+        };
+        let Ok(image) = Image::load_from_path(&src_path) else {
+            return false;
+        };
+        // `to_rgba8` handles both RGB and RGBA sources (including transparent PNG/WebP), whereas
+        // `to_rgb8` returns `None` for any image with an alpha channel.
+        let Some(rgba) = image.to_rgba8() else {
+            return false;
+        };
+        let scaled = downscale_rgba8(&rgba, COVER_HEIGHT);
+        let _ = write_thumb(&thumb_path, &scaled);
+        if let Ok(mut map) = self.decoded.lock() {
+            map.insert(url.to_string(), scaled);
+        }
+        true
     }
 
     fn fetch(&self, url: &str) -> bool {
@@ -177,6 +286,105 @@ impl CoverLoader {
     fn path_for_ext(&self, url: &str, extension: &str) -> PathBuf {
         self.dir.join(format!("{}.{extension}", cache_stem(&thumbnail_url(url))))
     }
+
+    fn thumb_path(&self, url: &str) -> PathBuf {
+        self.dir.join(format!("{}.thumb", cache_stem(&thumbnail_url(url))))
+    }
+}
+
+/// Area-averaged RGBA8 downscaler keeping aspect ratio so neither dimension exceeds `max_edge`.
+fn downscale_rgba8(
+    src: &SharedPixelBuffer<Rgba8Pixel>,
+    max_edge: u32,
+) -> SharedPixelBuffer<Rgba8Pixel> {
+    let sw = src.width();
+    let sh = src.height();
+    if sw == 0 || sh == 0 || (sw <= max_edge && sh <= max_edge) {
+        return src.clone();
+    }
+    let scale = (max_edge as f32 / sw as f32).min(max_edge as f32 / sh as f32);
+    let dw = ((sw as f32 * scale).round() as u32).max(1);
+    let dh = ((sh as f32 * scale).round() as u32).max(1);
+
+    let src_pixels = src.as_slice();
+    let mut dst = SharedPixelBuffer::<Rgba8Pixel>::new(dw, dh);
+    let dst_pixels = dst.make_mut_slice();
+
+    for dy in 0..dh {
+        let y0 = (dy * sh) / dh;
+        let y1 = (((dy + 1) * sh) / dh).max(y0 + 1).min(sh);
+        for dx in 0..dw {
+            let x0 = (dx * sw) / dw;
+            let x1 = (((dx + 1) * sw) / dw).max(x0 + 1).min(sw);
+            let mut r: u64 = 0;
+            let mut g: u64 = 0;
+            let mut b: u64 = 0;
+            let mut a: u64 = 0;
+            let mut count: u64 = 0;
+            for sy in y0..y1 {
+                let row_offset = (sy * sw) as usize;
+                for sx in x0..x1 {
+                    let px = src_pixels[row_offset + sx as usize];
+                    r += u64::from(px.r);
+                    g += u64::from(px.g);
+                    b += u64::from(px.b);
+                    a += u64::from(px.a);
+                    count += 1;
+                }
+            }
+            dst_pixels[(dy * dw + dx) as usize] = Rgba8Pixel {
+                r: (r / count) as u8,
+                g: (g / count) as u8,
+                b: (b / count) as u8,
+                a: (a / count) as u8,
+            };
+        }
+    }
+    dst
+}
+
+fn write_thumb(path: &Path, buf: &SharedPixelBuffer<Rgba8Pixel>) -> io::Result<()> {
+    let w = u16::try_from(buf.width()).map_err(|_| io::Error::other("width overflow"))?;
+    let h = u16::try_from(buf.height()).map_err(|_| io::Error::other("height overflow"))?;
+    let raw = buf.as_bytes();
+    let mut out = Vec::with_capacity(8 + raw.len());
+    out.extend_from_slice(THUMB_MAGIC_RGBA);
+    out.extend_from_slice(&w.to_le_bytes());
+    out.extend_from_slice(&h.to_le_bytes());
+    out.extend_from_slice(raw);
+    util::atomic_write(path, &out).map_err(|e| io::Error::other(e.to_string()))
+}
+
+fn read_thumb(path: &Path) -> Option<SharedPixelBuffer<Rgba8Pixel>> {
+    let bytes = std::fs::read(path).ok()?;
+    if bytes.len() < 8 {
+        return None;
+    }
+    let w = u16::from_le_bytes([bytes[4], bytes[5]]) as u32;
+    let h = u16::from_le_bytes([bytes[6], bytes[7]]) as u32;
+    if w == 0 || h == 0 || w > 512 || h > 512 {
+        return None;
+    }
+    let pixels = (w as usize).checked_mul(h as usize)?;
+    if &bytes[0..4] == THUMB_MAGIC_RGBA {
+        let expected = pixels.checked_mul(4)?;
+        if bytes.len() != 8 + expected {
+            return None;
+        }
+        return Some(SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&bytes[8..], w, h));
+    }
+    if &bytes[0..4] == THUMB_MAGIC_RGB {
+        let expected = pixels.checked_mul(3)?;
+        if bytes.len() != 8 + expected {
+            return None;
+        }
+        let mut buf = SharedPixelBuffer::<Rgba8Pixel>::new(w, h);
+        for (dst, chunk) in buf.make_mut_slice().iter_mut().zip(bytes[8..].chunks_exact(3)) {
+            *dst = Rgba8Pixel { r: chunk[0], g: chunk[1], b: chunk[2], a: 255 };
+        }
+        return Some(buf);
+    }
+    None
 }
 
 /// Append the CDN resize parameters without clobbering an existing query string.
@@ -310,5 +518,26 @@ mod tests {
         let loader = CoverLoader::new(&dir);
         let path = loader.path_for_ext("https://cdn.example/x", "jpg");
         assert_eq!(path.parent(), Some(Path::new(&dir)));
+    }
+
+    #[test]
+    fn downscale_and_thumb_roundtrip_handles_rgba_images() {
+        let mut big = SharedPixelBuffer::<Rgba8Pixel>::new(1200, 1600);
+        for px in big.make_mut_slice() {
+            *px = Rgba8Pixel { r: 100, g: 150, b: 200, a: 180 };
+        }
+        let small = downscale_rgba8(&big, 320);
+        assert_eq!(small.width(), 240);
+        assert_eq!(small.height(), 320);
+        assert_eq!(small.as_slice()[0], Rgba8Pixel { r: 100, g: 150, b: 200, a: 180 });
+
+        let path = std::env::temp_dir().join("skiff-cover-thumb-rgba-test.thumb");
+        let _ = std::fs::remove_file(&path);
+        write_thumb(&path, &small).unwrap();
+        let loaded = read_thumb(&path).unwrap();
+        assert_eq!(loaded.width(), 240);
+        assert_eq!(loaded.height(), 320);
+        assert_eq!(loaded.as_slice()[0], Rgba8Pixel { r: 100, g: 150, b: 200, a: 180 });
+        let _ = std::fs::remove_file(&path);
     }
 }

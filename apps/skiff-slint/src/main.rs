@@ -21,6 +21,7 @@ use skiff_core::http::Client;
 use skiff_core::install::{self, InstallOptions};
 use skiff_core::library::{self, GameGroup};
 use slint::{Color, ComponentHandle, ModelRc, SharedString, VecModel};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -141,6 +142,15 @@ fn stage_label(stage: &str) -> (&'static str, f32) {
     }
 }
 
+/// Local installation state for a main game, mirrored as an integer into Slint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum InstallStatus {
+    #[default]
+    NotInstalled = 0,
+    Installed = 1,
+    Partial = 2,
+}
+
 /// Which section a library row belongs to, mirrored as an integer into the Slint model.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowKind {
@@ -161,7 +171,7 @@ struct Row {
     title: String,
     sub: String,
     badge: String,
-    /// Main-game app name this row activates; empty for labels and orphan rows.
+    /// Main-game app name this row activates; empty for orphan labels and orphan rows.
     app: String,
     selectable: bool,
     /// Catalog key-image URL; empty means a generated placeholder.
@@ -172,6 +182,8 @@ struct Row {
     tone: Color,
     /// First visible character of the title, for the placeholder.
     initial: String,
+    /// Local install state under `install_root`.
+    install_status: InstallStatus,
 }
 
 /// Store titles are sometimes missing, in which case the app name is all we have.
@@ -179,13 +191,124 @@ fn display_title(entry: &GameEntry) -> String {
     if entry.title.is_empty() { entry.app_name.clone() } else { entry.title.clone() }
 }
 
-/// The "主游戏" section: one row per main game, with the owned add-on count on the right.
-fn build_main_rows(groups: &[GameGroup]) -> Vec<Row> {
+/// Extract a quoted JSON string field value (e.g. `"AppName": "Ginger"`) without pulling in extra deps.
+fn extract_json_string(text: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let pos = text.find(&needle)?;
+    let rest = &text[pos + needle.len()..];
+    let (_, after_colon) = rest.split_once(':')?;
+    let value = after_colon.split('"').nth(1)?.trim();
+    if value.is_empty() { None } else { Some(value.to_string()) }
+}
+
+/// Fast metadata read for `.egstore`: collects installed app names without parsing multi-MB manifests.
+fn read_installed_app_names(dir: &Path) -> Vec<String> {
+    let egstore = dir.join(".egstore");
+    let Ok(entries) = std::fs::read_dir(&egstore) else {
+        return Vec::new();
+    };
+    let mut apps = Vec::new();
+    let mut saw_item = false;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.extension().is_some_and(|ext| ext == "item") {
+            continue;
+        }
+        saw_item = true;
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let guid = extract_json_string(&text, "InstallationGuid")
+            .or_else(|| extract_json_string(&text, "HostInstallationGuid"))
+            .or_else(|| path.file_stem().map(|s| s.to_string_lossy().to_string()))
+            .unwrap_or_default();
+        if guid.is_empty() || !egstore.join(format!("{guid}.manifest")).is_file() {
+            continue;
+        }
+        if let Some(main_app) = extract_json_string(&text, "MainGameAppName") {
+            apps.push(main_app);
+        }
+        if let Some(app) = extract_json_string(&text, "AppName") {
+            apps.push(app);
+        }
+    }
+    if !apps.is_empty() || saw_item {
+        return apps;
+    }
+    // Fallback for legacy installs that carry a `.manifest` without an `.item`.
+    install::load_installed_components(dir)
+        .map(|components| {
+            components
+                .into_iter()
+                .flat_map(|c| [c.main_app_name, c.app_name])
+                .filter(|name| !name.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Scan `root` once and map lower-cased app names to their local install status and directory.
+///
+/// Running a single directory pass avoids O(N*M) filesystem scans on every refresh or timer tick.
+fn scan_local_installs(
+    root: &Path,
+    games: &[GameEntry],
+) -> HashMap<String, (InstallStatus, PathBuf)> {
+    let mut found: HashMap<String, (InstallStatus, PathBuf)> = HashMap::new();
+    if root.as_os_str().is_empty() {
+        return found;
+    }
+
+    if let Ok(entries) = std::fs::read_dir(root) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() || !dir.join(".egstore").is_dir() {
+                continue;
+            }
+            let app_names = read_installed_app_names(&dir);
+            if app_names.is_empty() {
+                continue;
+            }
+            let status = if install::has_partial_install(&dir) {
+                InstallStatus::Partial
+            } else {
+                InstallStatus::Installed
+            };
+            for name in app_names {
+                found.entry(name.to_lowercase()).or_insert_with(|| (status, dir.clone()));
+            }
+        }
+    }
+
+    // Also detect brand-new partial downloads whose `.egstore/*.item` has not been written yet.
+    for game in games.iter().filter(|game| !game.is_dlc) {
+        let key = game.app_name.to_lowercase();
+        if found.contains_key(&key) {
+            continue;
+        }
+        let default_dir = install::default_install_dir(root, game);
+        if install::has_partial_install(&default_dir) {
+            found.insert(key, (InstallStatus::Partial, default_dir));
+        }
+    }
+
+    found
+}
+
+/// The "主游戏" section: one row per main game, with owned add-on count and local status.
+fn build_main_rows(
+    groups: &[GameGroup],
+    local_status: &HashMap<String, (InstallStatus, PathBuf)>,
+) -> Vec<Row> {
     groups
         .iter()
         .map(|group| {
             let game = &group.game;
             let title = display_title(game);
+            let install_status = local_status
+                .get(&game.app_name.to_lowercase())
+                .map(|(status, _)| *status)
+                .unwrap_or(InstallStatus::NotInstalled);
             Row {
                 kind: RowKind::Main,
                 title: title.clone(),
@@ -193,7 +316,7 @@ fn build_main_rows(groups: &[GameGroup]) -> Vec<Row> {
                 badge: if group.dlc.is_empty() {
                     String::new()
                 } else {
-                    format!("附加内容 {}", group.dlc.len())
+                    format!("DLC {}", group.dlc.len())
                 },
                 app: game.app_name.clone(),
                 selectable: true,
@@ -201,6 +324,7 @@ fn build_main_rows(groups: &[GameGroup]) -> Vec<Row> {
                 developer: game.developer.clone(),
                 tone: tone_for(&game.app_name),
                 initial: initial_of(&title),
+                install_status,
             }
         })
         .collect()
@@ -208,7 +332,8 @@ fn build_main_rows(groups: &[GameGroup]) -> Vec<Row> {
 
 /// The "附加内容" section: add-ons grouped under their main game, then the unlinked ones.
 ///
-/// Add-on rows point at their main game because an add-on cannot be installed on its own.
+/// Both group headers and add-on rows point at their main game because an add-on cannot be
+/// installed on its own.
 fn build_addon_rows(groups: &[GameGroup], orphans: &[GameEntry]) -> Vec<Row> {
     let mut rows = Vec::new();
 
@@ -220,12 +345,13 @@ fn build_addon_rows(groups: &[GameGroup], orphans: &[GameEntry]) -> Vec<Row> {
             title: parent_title.clone(),
             sub: format!("{} 项", group.dlc.len()),
             badge: String::new(),
-            app: String::new(),
-            selectable: false,
+            app: parent.app_name.clone(),
+            selectable: true,
             cover_url: String::new(),
             developer: String::new(),
             tone: tone_for(&parent.app_name),
             initial: initial_of(&parent_title),
+            install_status: InstallStatus::NotInstalled,
         });
         for dlc in &group.dlc {
             let title = display_title(dlc);
@@ -240,6 +366,7 @@ fn build_addon_rows(groups: &[GameGroup], orphans: &[GameEntry]) -> Vec<Row> {
                 developer: dlc.developer.clone(),
                 tone: tone_for(&dlc.app_name),
                 initial: initial_of(&title),
+                install_status: InstallStatus::NotInstalled,
             });
         }
     }
@@ -256,6 +383,7 @@ fn build_addon_rows(groups: &[GameGroup], orphans: &[GameEntry]) -> Vec<Row> {
             developer: String::new(),
             tone: tone_for("orphan"),
             initial: "?".to_string(),
+            install_status: InstallStatus::NotInstalled,
         });
         for orphan in orphans {
             let title = display_title(orphan);
@@ -270,6 +398,7 @@ fn build_addon_rows(groups: &[GameGroup], orphans: &[GameEntry]) -> Vec<Row> {
                 developer: orphan.developer.clone(),
                 tone: tone_for(&orphan.app_name),
                 initial: initial_of(&title),
+                install_status: InstallStatus::NotInstalled,
             });
         }
     }
@@ -291,6 +420,7 @@ fn row_to_ui(row: &Row, covers: &CoverLoader) -> LibraryRow {
         tone: row.tone,
         initial: SharedString::from(row.initial.clone()),
         developer: SharedString::from(row.developer.clone()),
+        install_status: row.install_status as i32,
     }
 }
 
@@ -336,6 +466,10 @@ struct Snapshot {
     selected_dlc_text: String,
     /// A paused or interrupted download exists for the selected game.
     can_resume: bool,
+    /// Local install state for the selected game (0 = none, 1 = installed, 2 = partial).
+    selected_install_status: i32,
+    /// Error scoped to the detail drawer (kept separate from active download job `note`).
+    detail_error: String,
     // job identity, so the download page keeps showing the right game even when another library
     // entry is selected
     job_started: bool,
@@ -358,6 +492,7 @@ struct Snapshot {
     config_note_error: bool,
     setup_note: String,
     clear_code_input: bool,
+    collapse_account_edit: bool,
 }
 
 /// Library cache plus the filtered rows of both sections.
@@ -369,14 +504,29 @@ struct Library {
     main_rows: Vec<Row>,
     /// Rows of the "附加内容" section, group labels included.
     addon_rows: Vec<Row>,
+    /// Lower-cased app name -> (local install status, install directory).
+    local_status: HashMap<String, (InstallStatus, PathBuf)>,
+    /// Total main games that are installed or have partial progress on disk.
+    installed_count: usize,
+    /// Total main games that own at least one add-on.
+    with_dlc_count: usize,
+    /// Quick filter for the main-game grid: 0 = all, 1 = installed/partial, 2 = with add-ons.
+    filter_mode: i32,
     query: String,
     revision: u64,
 }
 
 impl Library {
-    /// Replace the whole set and re-apply the current search.
-    fn set_games(&mut self, games: Vec<GameEntry>) {
+    /// Replace the whole set, scan local installs under `install_root`, and re-apply filters.
+    fn set_games(&mut self, games: Vec<GameEntry>, install_root: &Path) {
         self.all = games;
+        self.local_status = scan_local_installs(install_root, &self.all);
+        self.refilter();
+    }
+
+    /// Re-scan local install status after config changes or install completion/pause/cancel.
+    fn rescan_local(&mut self, install_root: &Path) {
+        self.local_status = scan_local_installs(install_root, &self.all);
         self.refilter();
     }
 
@@ -389,16 +539,60 @@ impl Library {
         self.refilter();
     }
 
+    /// Apply a main-game quick filter (0 = all, 1 = installed/partial, 2 = with DLC).
+    fn set_filter(&mut self, mode: i32) {
+        let mode = if (0..=2).contains(&mode) { mode } else { 0 };
+        if self.filter_mode == mode {
+            return;
+        }
+        self.filter_mode = mode;
+        self.refilter();
+    }
+
     fn refilter(&mut self) {
+        let full_view = library::library_view(&self.all);
+        self.installed_count = full_view
+            .games
+            .iter()
+            .filter(|group| self.status_of(&group.game.app_name) != InstallStatus::NotInstalled)
+            .count();
+        self.with_dlc_count =
+            full_view.games.iter().filter(|group| !group.dlc.is_empty()).count();
+
         let needle = self.query.trim().to_lowercase();
         // Group-level matching: a group survives when its main game *or* any of its add-ons
         // matches, and then the whole group is shown (same rule the web page uses).
-        let view = library::library_view(&self.all);
-        let view = if needle.is_empty() { view } else { view.filtered(&needle) };
-        self.main_rows = build_main_rows(&view.games);
+        let view = if needle.is_empty() { full_view } else { full_view.filtered(&needle) };
+
+        let filtered_games: Vec<GameGroup> = view
+            .games
+            .iter()
+            .filter(|group| match self.filter_mode {
+                1 => self.status_of(&group.game.app_name) != InstallStatus::NotInstalled,
+                2 => !group.dlc.is_empty(),
+                _ => true,
+            })
+            .cloned()
+            .collect();
+
+        self.main_rows = build_main_rows(&filtered_games, &self.local_status);
+        // The Add-ons sub-view follows the search query only (main-game filter pills don't hide it).
         self.addon_rows = build_addon_rows(&view.games, &view.orphan_dlc);
-        self.visible = view.games;
+        self.visible = filtered_games;
         self.revision = self.revision.wrapping_add(1);
+    }
+
+    fn status_of(&self, app_name: &str) -> InstallStatus {
+        self.local_status
+            .get(&app_name.to_lowercase())
+            .map(|(status, _)| *status)
+            .unwrap_or(InstallStatus::NotInstalled)
+    }
+
+    fn local_dir_of(&self, app_name: &str) -> Option<&Path> {
+        self.local_status
+            .get(&app_name.to_lowercase())
+            .map(|(_, path)| path.as_path())
     }
 
     fn base_count(&self) -> usize {
@@ -410,17 +604,11 @@ impl Library {
     }
 
     /// True when the account owns any add-on at all, regardless of the current search.
-    ///
-    /// The section stays visible while searching so its "no match" state is explainable instead of
-    /// the whole panel appearing and disappearing as the query changes.
     fn has_addons(&self) -> bool {
         self.all.iter().any(|game| game.is_dlc)
     }
 
-    /// Group selected by its main-game app name, even when the current search hides it.
-    ///
-    /// The download page must be able to resume a job after a refresh or a search that filtered the
-    /// game out, so this falls back to a view of the full library instead of `visible`.
+    /// Group selected by its main-game app name, even when the current search or filter hides it.
     fn group_any(&self, app_name: &str) -> Option<GameGroup> {
         if let Some(group) = self.group_for(app_name) {
             return Some(group.clone());
@@ -555,12 +743,17 @@ fn start_refresh(state: Arc<State>) {
             Ok(games) => {
                 let bases = games.iter().filter(|game| !game.is_dlc).count();
                 let dlcs = games.iter().filter(|game| game.is_dlc).count();
+                let install_root = worker_state
+                    .config
+                    .lock()
+                    .map(|cfg| PathBuf::from(&cfg.install_root))
+                    .unwrap_or_default();
                 worker_state
                     .covers
                     .request_all(games.iter().map(|game| game.cover_url.clone()));
                 let shown = {
                     let mut library = worker_state.library.lock().unwrap();
-                    library.set_games(games);
+                    library.set_games(games, &install_root);
                     library.visible.len()
                 };
                 if let Ok(mut snapshot) = worker_state.snapshot.lock() {
@@ -570,7 +763,7 @@ fn start_refresh(state: Arc<State>) {
                         format!("已更新 {bases} 款游戏 · {dlcs} 个附加内容 · {elapsed:.1} 秒")
                     } else {
                         format!(
-                            "已更新 {bases} 款游戏 · {dlcs} 个附加内容，匹配 {shown} 款 · {elapsed:.1} 秒"
+                            "已更新 {bases} 款游戏 · {dlcs} 个附加内容，当前显示 {shown} 款 · {elapsed:.1} 秒"
                         )
                     };
                     snapshot.refresh_kind = TONE_OK;
@@ -603,16 +796,21 @@ fn push_selection(ui: &AppWindow, state: &State) {
         .ok()
         .and_then(|slot| slot.clone());
 
-    let group = selected.as_ref().and_then(|app_name| {
-        state
-            .library
-            .lock()
-            .ok()
-            .and_then(|library| library.group_for(app_name).cloned())
-    });
+    let (group, cached_local) = selected
+        .as_ref()
+        .and_then(|app_name| {
+            state.library.lock().ok().and_then(|library| {
+                let group = library.group_any(app_name)?;
+                let local = library
+                    .local_dir_of(app_name)
+                    .map(|dir| (library.status_of(app_name), dir.to_path_buf()));
+                Some((Some(group), local))
+            })
+        })
+        .unwrap_or((None, None));
 
     let Some(group) = group else {
-        // Nothing selected, or the selection was filtered/replaced away: clear the detail pane.
+        // Nothing selected, or the game no longer exists after a library refresh: clear detail.
         if selected.is_some() {
             if let Ok(mut slot) = state.selected_app.lock() {
                 *slot = None;
@@ -622,6 +820,7 @@ fn push_selection(ui: &AppWindow, state: &State) {
         ui.set_selected_app(SharedString::default());
         ui.set_target_dir(SharedString::default());
         ui.set_can_resume(false);
+        ui.set_selected_install_status(InstallStatus::NotInstalled as i32);
         ui.set_selected_dlc_count(0);
         ui.set_selected_dlc_text(SharedString::default());
         ui.set_selected_cover(slint::Image::default());
@@ -636,6 +835,8 @@ fn push_selection(ui: &AppWindow, state: &State) {
             snapshot.selected_dlc_count = 0;
             snapshot.selected_dlc_text.clear();
             snapshot.can_resume = false;
+            snapshot.selected_install_status = InstallStatus::NotInstalled as i32;
+            snapshot.detail_error.clear();
         });
         return;
     };
@@ -646,12 +847,25 @@ fn push_selection(ui: &AppWindow, state: &State) {
         .lock()
         .map(|cfg| PathBuf::from(&cfg.install_root))
         .unwrap_or_default();
-    // Reuse an existing install if the catalog enriched `FolderName` after the game was first
-    // installed, otherwise fall back to the normal default directory.
-    let target = install::find_existing_install(&base, &game.app_name)
-        .unwrap_or_else(|| install::default_install_dir(&base, game));
+    let (install_status, target) = match cached_local {
+        Some((status, dir)) => (status, dir),
+        None => {
+            let dir = install::find_existing_install(&base, &game.app_name)
+                .unwrap_or_else(|| install::default_install_dir(&base, game));
+            let status = if install::has_partial_install(&dir) {
+                InstallStatus::Partial
+            } else if dir.join(".egstore").is_dir()
+                && install::load_installed_components(&dir).is_ok()
+            {
+                InstallStatus::Installed
+            } else {
+                InstallStatus::NotInstalled
+            };
+            (status, dir)
+        }
+    };
     let title = display_title(game);
-    let can_resume = install::has_partial_install(&target);
+    let can_resume = install_status == InstallStatus::Partial || install::has_partial_install(&target);
     let dlc_text = group
         .dlc
         .iter()
@@ -664,6 +878,7 @@ fn push_selection(ui: &AppWindow, state: &State) {
     ui.set_selected_app(SharedString::from(game.app_name.clone()));
     ui.set_target_dir(SharedString::from(target.to_string_lossy().to_string()));
     ui.set_can_resume(can_resume);
+    ui.set_selected_install_status(install_status as i32);
     ui.set_selected_dlc_count(group.dlc.len() as i32);
     ui.set_selected_dlc_text(SharedString::from(dlc_text.clone()));
     ui.set_selected_cover(cover.clone().unwrap_or_default());
@@ -678,6 +893,7 @@ fn push_selection(ui: &AppWindow, state: &State) {
         snapshot.selected_dlc_count = group.dlc.len();
         snapshot.selected_dlc_text = dlc_text;
         snapshot.can_resume = can_resume;
+        snapshot.selected_install_status = install_status as i32;
     });
 }
 
@@ -914,6 +1130,15 @@ fn begin_install(
                     install::has_partial_install(Path::new(&snapshot.target_dir));
             }
         });
+        // Refresh cached local install badges & "已安装" filter count after the job ends.
+        let install_root = worker_state
+            .config
+            .lock()
+            .map(|c| PathBuf::from(&c.install_root))
+            .unwrap_or_default();
+        if let Ok(mut library) = worker_state.library.lock() {
+            library.rescan_local(&install_root);
+        }
     });
     Ok(())
 }
@@ -949,6 +1174,9 @@ fn apply_settings(ui: &AppWindow, state: &State) -> Result<Config, String> {
 
     if let Ok(mut cached) = state.config.lock() {
         *cached = cfg.clone();
+    }
+    if let Ok(mut library) = state.library.lock() {
+        library.rescan_local(Path::new(&cfg.install_root));
     }
     // Echo the normalized values back into the form.
     ui.set_concurrency_text(SharedString::from(cfg.concurrency.downloads.to_string()));
@@ -1024,11 +1252,16 @@ fn main() -> Result<(), slint::PlatformError> {
         if !cached.is_empty() {
             cached_count = cached.len();
             cached_coverless = cached.iter().all(|game| game.cover_url.is_empty());
+            let install_root = state
+                .config
+                .lock()
+                .map(|cfg| PathBuf::from(&cfg.install_root))
+                .unwrap_or_default();
             state
                 .covers
                 .request_all(cached.iter().map(|game| game.cover_url.clone()));
             if let Ok(mut library) = state.library.lock() {
-                library.set_games(cached);
+                library.set_games(cached, &install_root);
             }
         }
     }
@@ -1047,12 +1280,20 @@ fn main() -> Result<(), slint::PlatformError> {
         ui.on_refresh(move || start_refresh(state.clone()));
     }
 
-    // ---- search --------------------------------------------------------------------------
+    // ---- search & quick filter -----------------------------------------------------------
     {
         let state = state.clone();
         ui.on_filter_games(move |text: SharedString| {
             if let Ok(mut library) = state.library.lock() {
                 library.set_query(text.as_str());
+            }
+        });
+    }
+    {
+        let state = state.clone();
+        ui.on_set_library_filter(move |mode: i32| {
+            if let Ok(mut library) = state.library.lock() {
+                library.set_filter(mode);
             }
         });
     }
@@ -1067,12 +1308,13 @@ fn main() -> Result<(), slint::PlatformError> {
             if app_name.is_empty() {
                 return;
             }
-            // Add-on rows carry their main game's app name; labels and orphans are not selectable.
+            // Both main games and add-on rows (or group headers) carry the main game's app name.
+            // Checking `group_any` ensures add-ons stay clickable even when a main-game filter is active.
             let selectable = state
                 .library
                 .lock()
                 .ok()
-                .map(|library| library.main_rows.iter().any(|row| row.app == app_name))
+                .map(|library| library.group_any(&app_name).is_some())
                 .unwrap_or(false);
             if !selectable {
                 return;
@@ -1080,6 +1322,7 @@ fn main() -> Result<(), slint::PlatformError> {
             if let Ok(mut slot) = state.selected_app.lock() {
                 *slot = Some(app_name);
             }
+            edit(&state, |snapshot| snapshot.detail_error.clear());
             push_selection(&ui, &state);
         });
     }
@@ -1125,9 +1368,10 @@ fn main() -> Result<(), slint::PlatformError> {
                             snapshot.login_busy = false;
                             snapshot.login_error.clear();
                             snapshot.clear_code_input = true;
+                            snapshot.collapse_account_edit = true;
                             snapshot.config_note = "授权成功，账号已连接。".to_string();
                             snapshot.config_note_error = false;
-                            snapshot.setup_note = "账号已连接，点「完成配置」继续。".to_string();
+                            snapshot.setup_note = "账号已连接，请点击「下一步」设置安装目录。".to_string();
                         });
                         worker_state.needs_refresh.store(true, Ordering::Relaxed);
                     }
@@ -1160,6 +1404,7 @@ fn main() -> Result<(), slint::PlatformError> {
             match apply_settings(&ui, &state) {
                 Ok(_) => {
                     ui.set_setup_open(false);
+                    ui.set_setup_step(0);
                     ui.set_page(0);
                     ui.set_detail_open(false);
                     edit(&state, |snapshot| {
@@ -1221,20 +1466,19 @@ fn main() -> Result<(), slint::PlatformError> {
             let Some(app_name) = state.selected_app.lock().ok().and_then(|slot| slot.clone())
             else {
                 edit(&state, |snapshot| {
-                    snapshot.note = "请先选择一款游戏".to_string();
-                    snapshot.note_error = true;
+                    snapshot.detail_error = "请先选择一款游戏".to_string();
                 });
                 return;
             };
             let include_dlc = ui.get_include_dlc();
             match begin_install(&state, &app_name, include_dlc) {
                 Ok(()) => {
+                    edit(&state, |snapshot| snapshot.detail_error.clear());
                     ui.set_page(1);
                     ui.set_detail_open(false);
                 }
                 Err(message) => edit(&state, |snapshot| {
-                    snapshot.note = message;
-                    snapshot.note_error = true;
+                    snapshot.detail_error = message;
                 }),
             }
         });
@@ -1263,7 +1507,8 @@ fn main() -> Result<(), slint::PlatformError> {
                 }),
             }
         });
-    }    {
+    }
+    {
         let state = state.clone();
         ui.on_pause(move || {
             if !state.snapshot.lock().map(|s| s.running).unwrap_or(false) {
@@ -1330,6 +1575,14 @@ fn main() -> Result<(), slint::PlatformError> {
                         "已取消 · 没有需要删除的文件。".to_string()
                     };
                 });
+                let install_root = worker_state
+                    .config
+                    .lock()
+                    .map(|c| PathBuf::from(&c.install_root))
+                    .unwrap_or_default();
+                if let Ok(mut library) = worker_state.library.lock() {
+                    library.rescan_local(&install_root);
+                }
             });
         });
     }
@@ -1369,9 +1622,12 @@ fn main() -> Result<(), slint::PlatformError> {
                     addon_rows,
                     base_count,
                     dlc_count,
+                    installed_count,
+                    with_dlc_count,
                     matched_games,
                     addon_shown,
                     query,
+                    filter_mode,
                     loaded,
                     has_addons,
                 ) = {
@@ -1381,9 +1637,16 @@ fn main() -> Result<(), slint::PlatformError> {
                         library.addon_rows.clone(),
                         library.base_count(),
                         library.dlc_count(),
+                        library.installed_count,
+                        library.with_dlc_count,
                         library.main_rows.len(),
-                        library.addon_rows.iter().filter(|row| row.selectable).count(),
+                        library
+                            .addon_rows
+                            .iter()
+                            .filter(|row| matches!(row.kind, RowKind::Addon | RowKind::Orphan))
+                            .count(),
                         library.query.clone(),
+                        library.filter_mode,
                         !library.all.is_empty(),
                         library.has_addons(),
                     )
@@ -1397,30 +1660,45 @@ fn main() -> Result<(), slint::PlatformError> {
 
                 ui.set_main_rows(ModelRc::new(VecModel::from(main_rows)));
                 ui.set_addon_rows(ModelRc::new(VecModel::from(addon_rows)));
-                ui.set_main_count_text(SharedString::from(format!("{matched_games} 款")));
-                ui.set_addon_count_text(SharedString::from(format!("{addon_shown} 个")));
+                ui.set_base_count(base_count as i32);
+                ui.set_addon_total_count(dlc_count as i32);
+                ui.set_installed_count(installed_count as i32);
+                ui.set_with_dlc_count(with_dlc_count as i32);
+                ui.set_main_count_text(SharedString::from(format!("{matched_games}")));
+                ui.set_addon_count_text(SharedString::from(format!("{addon_shown}")));
                 ui.set_library_loaded(loaded);
                 ui.set_has_addons(has_addons);
-                ui.set_games_count_text(SharedString::from(if query.trim().is_empty() {
-                    format!("{base_count} 款游戏 · {dlc_count} 个附加内容")
-                } else {
-                    format!("{base_count} 款 · {dlc_count} 个附加内容 · 匹配 {matched_games}")
-                }));
+                ui.set_games_count_text(SharedString::from(
+                    if query.trim().is_empty() && filter_mode == 0 {
+                        if installed_count > 0 {
+                            format!(
+                                "{base_count} 款主游戏 · {dlc_count} 个附加内容 · {installed_count} 款已安装"
+                            )
+                        } else {
+                            format!("{base_count} 款主游戏 · {dlc_count} 个附加内容")
+                        }
+                    } else {
+                        format!(
+                            "当前显示 {matched_games} / {base_count} 款主游戏 · {dlc_count} 个附加内容"
+                        )
+                    },
+                ));
 
-                // The refresh may have dropped the selected game, and the search may have filtered
-                // it out; in both cases the selection has to follow the visible main games.
+                // Drop the selection only when the game no longer exists in the library at all
+                // (e.g. after switching accounts).
                 let selected = state.selected_app.lock().ok().and_then(|slot| slot.clone());
-                let still_visible = selected.as_ref().is_some_and(|app| {
+                let still_exists = selected.as_ref().is_some_and(|app| {
                     state
                         .library
                         .lock()
-                        .map(|library| library.main_rows.iter().any(|row| row.app == *app))
+                        .map(|library| library.group_any(app).is_some())
                         .unwrap_or(false)
                 });
-                if selected.is_some() && !still_visible {
+                if selected.is_some() && !still_exists {
                     if let Ok(mut slot) = state.selected_app.lock() {
                         *slot = None;
                     }
+                    ui.set_detail_open(false);
                 }
                 push_selection(&ui, &state);
                 shown_revision = revision;
@@ -1463,10 +1741,9 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_job_tone(tone_for(&snapshot.job_app));
             ui.set_job_initial(SharedString::from(initial_of(&snapshot.job_title)));
 
-            // The job cover may only arrive after the download started; try again when the cache
-            // reports a new file instead of polling the disk on every tick.
-            let job_cover_ready = !snapshot.job_cover_url.is_empty()
-                && state.covers.cached_path(&snapshot.job_cover_url).is_some();
+            // The job cover may arrive after the download started; check the in-memory decoded map
+            // instead of touching the disk on every tick.
+            let job_cover_ready = state.covers.is_decoded(&snapshot.job_cover_url);
             if snapshot.job_cover_url != shown_job_cover_target
                 || (job_cover_ready && !shown_job_cover_loaded)
             {
@@ -1481,8 +1758,10 @@ fn main() -> Result<(), slint::PlatformError> {
             ui.set_selected_app(SharedString::from(snapshot.selected_app.clone()));
             ui.set_target_dir(SharedString::from(snapshot.target_dir.clone()));
             ui.set_can_resume(snapshot.can_resume);
+            ui.set_selected_install_status(snapshot.selected_install_status);
             ui.set_selected_dlc_count(snapshot.selected_dlc_count as i32);
             ui.set_selected_dlc_text(SharedString::from(snapshot.selected_dlc_text.clone()));
+            ui.set_detail_error(SharedString::from(snapshot.detail_error.clone()));
 
             ui.set_refresh_busy(snapshot.refresh_busy);
             ui.set_refresh_progress(snapshot.refresh_progress);
@@ -1510,6 +1789,10 @@ fn main() -> Result<(), slint::PlatformError> {
             if snapshot.clear_code_input {
                 ui.set_code_input(SharedString::default());
                 edit(&state, |snapshot| snapshot.clear_code_input = false);
+            }
+            if snapshot.collapse_account_edit {
+                ui.set_account_edit_open(false);
+                edit(&state, |snapshot| snapshot.collapse_account_edit = false);
             }
         });
     }
@@ -1550,12 +1833,13 @@ mod tests {
             game("Other", "Other Game"),
         ];
         let view = library::library_view(&games);
-        let rows = build_main_rows(&view.games);
+        let rows = build_main_rows(&view.games, &HashMap::new());
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].app, "Ginger");
-        assert_eq!(rows[0].badge, "附加内容 1");
+        assert_eq!(rows[0].badge, "DLC 1");
         assert!(rows[0].selectable);
+        assert_eq!(rows[0].install_status, InstallStatus::NotInstalled);
         assert_eq!(rows[1].app, "Other");
         assert_eq!(rows[1].badge, "");
         assert_eq!(rows[1].title, "Other Game");
@@ -1586,11 +1870,14 @@ mod tests {
         );
         assert_eq!(rows[0].title, "Game A");
         assert_eq!(rows[0].sub, "2 项");
+        assert_eq!(rows[0].app, "A");
+        assert!(rows[0].selectable);
         // Add-ons are sorted by title inside their group by the core view.
         assert_eq!(rows[1].title, "A One");
         assert_eq!(rows[1].app, "A");
         assert!(rows[1].selectable);
         assert_eq!(rows[3].title, "Game B");
+        assert_eq!(rows[3].app, "B");
         assert_eq!(rows[4].app, "B");
         assert!(!rows.iter().any(|row| row.title == "Game C"));
     }
@@ -1606,6 +1893,7 @@ mod tests {
 
         assert_eq!(kinds(&rows), vec![RowKind::GroupLabel, RowKind::Orphan]);
         assert_eq!(rows[0].title, "未关联主游戏");
+        assert!(!rows[0].selectable);
         assert_eq!(rows[1].title, "Lost Add-on");
         assert_eq!(rows[1].badge, "未关联");
         assert!(!rows[1].selectable);
@@ -1634,7 +1922,7 @@ mod tests {
         addon.developer = "CD PROJEKT RED".into();
 
         let view = library::library_view(&[base, addon]);
-        let main = build_main_rows(&view.games);
+        let main = build_main_rows(&view.games, &HashMap::new());
         let addons = build_addon_rows(&view.games, &view.orphan_dlc);
 
         assert_eq!(main[0].cover_url, "https://cdn.example/base");
@@ -1642,6 +1930,88 @@ mod tests {
         assert_eq!(main[0].initial, "C");
         assert_eq!(addons[1].cover_url, "https://cdn.example/dlc");
         assert_eq!(addons[1].developer, "CD PROJEKT RED");
+    }
+
+    #[test]
+    fn library_filters_by_install_status_and_dlc_while_preserving_addon_view() {
+        let games = vec![
+            game("A", "Alpha Installed"),
+            dlc("a1", "Alpha Pack", "A"),
+            game("B", "Beta Partial"),
+            game("C", "Gamma Cloud Only"),
+            dlc("c1", "Gamma Expansion", "C"),
+        ];
+        let mut lib = Library::default();
+        lib.all = games;
+        lib.local_status.insert("a".into(), (InstallStatus::Installed, PathBuf::from("D:/Games/A")));
+        lib.local_status.insert("b".into(), (InstallStatus::Partial, PathBuf::from("D:/Games/B")));
+        lib.refilter();
+
+        assert_eq!(lib.installed_count, 2);
+        assert_eq!(lib.with_dlc_count, 2);
+        assert_eq!(lib.main_rows.len(), 3);
+
+        // Filter = 1 (installed / partial)
+        lib.set_filter(1);
+        let apps: Vec<&str> = lib.main_rows.iter().map(|r| r.app.as_str()).collect();
+        assert_eq!(apps, vec!["A", "B"]);
+        assert_eq!(lib.main_rows[0].install_status, InstallStatus::Installed);
+        assert_eq!(lib.main_rows[1].install_status, InstallStatus::Partial);
+        // Add-on view stays intact for C's DLC even when main-game filter is set to installed.
+        assert!(lib.addon_rows.iter().any(|r| r.app == "C"));
+
+        // Filter = 2 (with DLC)
+        lib.set_filter(2);
+        let apps: Vec<&str> = lib.main_rows.iter().map(|r| r.app.as_str()).collect();
+        assert_eq!(apps, vec!["A", "C"]);
+
+        // Combined with search query
+        lib.set_query("gamma");
+        assert_eq!(lib.main_rows.len(), 1);
+        assert_eq!(lib.main_rows[0].app, "C");
+    }
+
+    #[test]
+    fn scan_local_installs_detects_installed_and_partial_games() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("skiff-ui-scan-test-{nonce}"));
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Installed game with `.egstore/*.item` + matching `.manifest`
+        let installed_eg = root.join("GameA").join(".egstore");
+        std::fs::create_dir_all(&installed_eg).unwrap();
+        std::fs::write(
+            installed_eg.join("AAA.item"),
+            r#"{"AppName":"AppA","MainGameAppName":"AppA","InstallationGuid":"AAA","DisplayName":"Game A"}"#,
+        )
+        .unwrap();
+        std::fs::write(installed_eg.join("AAA.manifest"), b"stub-manifest").unwrap();
+
+        // Partial download with `skiff.resume` (no `.item` yet)
+        let partial_eg = root.join("AppB").join(".egstore");
+        std::fs::create_dir_all(&partial_eg).unwrap();
+        std::fs::write(partial_eg.join("skiff.resume"), b"{}").unwrap();
+
+        // Broken `.item` without a matching `.manifest` must not count as installed
+        let broken_eg = root.join("GameC").join(".egstore");
+        std::fs::create_dir_all(&broken_eg).unwrap();
+        std::fs::write(
+            broken_eg.join("CCC.item"),
+            r#"{"AppName":"AppC","MainGameAppName":"AppC","InstallationGuid":"CCC"}"#,
+        )
+        .unwrap();
+
+        let games = vec![game("AppA", "Game A"), game("AppB", "Game B"), game("AppC", "Game C")];
+        let map = scan_local_installs(&root, &games);
+
+        assert_eq!(map.get("appa").map(|(s, _)| *s), Some(InstallStatus::Installed));
+        assert_eq!(map.get("appb").map(|(s, _)| *s), Some(InstallStatus::Partial));
+        assert!(!map.contains_key("appc"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
